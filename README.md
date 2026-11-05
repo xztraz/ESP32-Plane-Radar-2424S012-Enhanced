@@ -6,6 +6,18 @@ A customized fork of [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP3
 
 This is an independently customized firmware branch, **not an official release** of the upstream project. The new semantic version describes this fork; it does **not** imply that every upstream `v1.1.5` change has been merged. See [CHANGELOG.md](CHANGELOG.md) for the changes relative to upstream.
 
+## Pictures
+
+<img src="docs/images/radar-running.jpg" alt="Plane Radar running on the ESP32-2424S012 round display" width="480">
+
+### Background colors
+
+![Classic PPI background color previews](docs/images/classic-ppi-colors.png)
+
+### Radar patterns
+
+![Six radar background pattern previews](docs/images/radar-patterns.png)
+
 ## Features
 
 - Live aircraft positions from [adsb.fi](https://adsb.fi/) approximately every 5 seconds, via BearSSL HTTPS.
