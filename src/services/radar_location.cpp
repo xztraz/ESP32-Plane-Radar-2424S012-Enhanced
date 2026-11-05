@@ -73,8 +73,9 @@ bool saveFromStrings(const char* lat_str, const char* lon_str) {
   if (!validLatLon(lat, lon)) {
     return false;
   }
+  if (lat == s_lat && lon == s_lon) return true;
   persist(lat, lon);
-  Serial.printf("Radar location saved: %.6f, %.6f\n", lat, lon);
+  Serial.printf("Radar location saved: %.6f, %.6f\r\n", lat, lon);
   return true;
 }
 

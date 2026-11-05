@@ -1,12 +1,13 @@
 #include "ui/runway_overlay.h"
+#include <algorithm>
+#include "ui/pixel_label_font.h"
 
-#include <lgfx/v1/lgfx_fonts.hpp>
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 #include "data/large_airports.h"
-#include "hardware/display_font.h"
 #include "services/radar_location.h"
 #include "ui/radar_range.h"
 #include "ui/radar_theme.h"
@@ -18,56 +19,34 @@ constexpr float kKmPerDeg = 111.0f;
 constexpr float kDegToRad = 3.14159265f / 180.0f;
 constexpr size_t kMaxAirportLabels = 32;
 
-bool s_in_range[data::large_airports::kAirportCount];
-bool s_label_pending[data::large_airports::kAirportCount];
+// 0 = unchecked, 1 = outside search radius, 2 = within search radius,
+// 3 = within radius and already scheduled for an airport label.
+// Uses a compact combined airport-state cache.
+uint8_t s_airport_state[data::large_airports::kAirportCount];
 
-bool s_runway_label_ready = false;
-bool s_runway_label_use_vlw = false;
-float s_runway_label_vlw_size = 0.38f;
-const lgfx::GFXfont* s_runway_label_gfx = &fonts::FreeSansBold12pt7b;
+// Visible runways rarely approach this count on a 240x240 local radar.
+// A bounded cache avoids heap allocation and falls back to the original
+// full scan if more runways become visible; no runways are ever omitted.
+constexpr size_t kMaxCachedRunways = 96;
+struct CachedRunway {
+  int16_t x0, y0, x1, y1;
+};
+static CachedRunway s_cached_runways[kMaxCachedRunways];
+static uint16_t s_cached_airport_labels[kMaxAirportLabels];
+struct FixedAirportLabel {
+  uint16_t airport;
+  int16_t x, y;  // top-left glyph position, computed at range/location change
+};
+static FixedAirportLabel s_fixed_labels[kMaxAirportLabels];
+static size_t s_fixed_label_count = 0;
+static size_t s_cached_runway_count = 0;
+static size_t s_cached_label_count = 0;
+static bool s_cache_valid = false;
+static bool s_cache_overflow = false;
+static double s_cache_lat = 0.0;
+static double s_cache_lon = 0.0;
+static float s_cache_range = 0.0f;
 
-int measureVlwHeight(lgfx::LGFXBase& gfx, float size) {
-  gfx.setTextSize(size);
-  return gfx.fontHeight();
-}
-
-float findVlwSizeForHeight(lgfx::LGFXBase& gfx, int target_px) {
-  float lo = 0.2f;
-  float hi = 1.2f;
-  for (int i = 0; i < 14; ++i) {
-    const float mid = (lo + hi) * 0.5f;
-    if (measureVlwHeight(gfx, mid) < target_px) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
-  }
-  return hi;
-}
-
-void initRunwayLabelStyle(lgfx::LGFXBase& gfx) {
-  if (s_runway_label_ready) {
-    return;
-  }
-
-  const int target = radar::kRunwayLabelHeightPx;
-  if (displayFontIsSmooth()) {
-    s_runway_label_use_vlw = true;
-    s_runway_label_vlw_size = findVlwSizeForHeight(gfx, target);
-  } else {
-    s_runway_label_gfx = &fonts::FreeSansBold12pt7b;
-    s_runway_label_use_vlw = false;
-  }
-  s_runway_label_ready = true;
-}
-
-void applyRunwayLabelStyle(lgfx::LGFXBase& gfx) {
-  if (s_runway_label_use_vlw) {
-    displayFontSetSmoothSize(gfx, s_runway_label_vlw_size);
-  } else {
-    displayFontSetBitmap(gfx, s_runway_label_gfx);
-  }
-}
 
 float e7ToDeg(int32_t e7) { return static_cast<float>(e7) * 1e-7f; }
 
@@ -162,59 +141,85 @@ bool segmentIntersectsDisc(int x0, int y0, int x1, int y1) {
   return (t0 >= 0.0f && t0 <= 1.0f) || (t1 >= 0.0f && t1 <= 1.0f);
 }
 
-void drawBoldRunwayLabel(lgfx::LGFXBase& gfx, const char* ident, int mx, int my) {
-  const int tw = gfx.textWidth(ident);
-  const int th = gfx.fontHeight();
-  constexpr int kPadX = 2;
-  constexpr int kPadY = 1;
-
-  gfx.setTextDatum(textdatum_t::bottom_center);
-  const int left = mx - tw / 2 - kPadX;
-  const int top = my - th - kPadY;
-  gfx.fillRect(left, top, tw + kPadX * 2, th + kPadY, radar::kColorBackground);
-  gfx.setTextColor(radar::kColorRunwayLabel, radar::kColorBackground);
-  gfx.drawString(ident, mx - 1, my);
-  gfx.drawString(ident, mx + 1, my);
-  gfx.drawString(ident, mx, my);
-}
-
-bool drawRunwayLine(lgfx::LGFXBase& gfx, const data::large_airports::Runway& rw) {
+bool projectRunwayLine(const data::large_airports::Runway& rw,
+                       CachedRunway* out) {
   const float le_lat = e7ToDeg(rw.le_lat_e7);
   const float le_lon = e7ToDeg(rw.le_lon_e7);
   const float he_lat = e7ToDeg(rw.he_lat_e7);
   const float he_lon = e7ToDeg(rw.he_lon_e7);
 
-  int x0 = 0;
-  int y0 = 0;
-  int x1 = 0;
-  int y1 = 0;
+  int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
   latLonToScreen(le_lat, le_lon, &x0, &y0);
   latLonToScreen(he_lat, he_lon, &x1, &y1);
-
-  if (!segmentIntersectsDisc(x0, y0, x1, y1)) {
-    return false;
-  }
-
+  if (!segmentIntersectsDisc(x0, y0, x1, y1)) return false;
   clipPointToOuterRing(x0, y0, &x1, &y1);
   clipPointToOuterRing(x1, y1, &x0, &y0);
-
-  gfx.drawWideLine(x0, y0, x1, y1, radar::kRunwayLineHalfWidth,
-                   radar::kColorRunway);
+  *out = {static_cast<int16_t>(x0), static_cast<int16_t>(y0),
+          static_cast<int16_t>(x1), static_cast<int16_t>(y1)};
   return true;
 }
 
-void offsetLabelFromCenter(int ax, int ay, int* lx, int* ly) {
-  const int dx = ax - radar::kCenterX;
-  const int dy = ay - radar::kCenterY;
-  const float len = sqrtf(static_cast<float>(dx * dx + dy * dy));
-  const int gap = radar::kRunwayLabelGapPx;
-  if (len < 1.0f) {
-    *lx = ax;
-    *ly = ay - gap;
-    return;
+void drawProjectedRunway(lgfx::LGFXBase& gfx, const CachedRunway& line) {
+  gfx.drawWideLine(line.x0, line.y0, line.x1, line.y1,
+                   radar::kRunwayLineHalfWidth, radar::kColorRunway);
+}
+
+// The label solution is calculated once per location/range, never per frame.
+void positionAirportLabels();
+
+void rebuildRunwayCache(double center_lat, double center_lon, float radius_km) {
+  s_cache_lat = center_lat;
+  s_cache_lon = center_lon;
+  s_cache_range = radius_km;
+  s_cached_runway_count = 0;
+  s_cached_label_count = 0;
+  s_fixed_label_count = 0;
+  s_cache_overflow = false;
+  s_cache_valid = true;
+
+  const double center_cos = fabs(cos(center_lat * kDegToRad));
+  const double safe_cos = center_cos > 0.0001 ? center_cos : 0.0001;
+  const int64_t center_lat_e7 = static_cast<int64_t>(llround(center_lat * 1e7));
+  const int64_t center_lon_e7 = static_cast<int64_t>(llround(center_lon * 1e7));
+  const int64_t lat_limit_e7 = static_cast<int64_t>(ceil((radius_km / kKmPerDeg + 0.001) * 1e7));
+  const int64_t lon_limit_e7 = static_cast<int64_t>(ceil((radius_km / (kKmPerDeg * safe_cos) + 0.001) * 1e7));
+
+  memset(s_airport_state, 0, sizeof(s_airport_state));
+  for (size_t i = 0; i < data::large_airports::kRunwayCount; ++i) {
+    const auto& rw = data::large_airports::kRunways[i];
+    const uint16_t ap_idx = rw.airport_idx;
+    uint8_t& ap_state = s_airport_state[ap_idx];
+    if (ap_state == 0) {
+      const auto& ap = data::large_airports::kAirports[ap_idx];
+      const int64_t dlat = static_cast<int64_t>(ap.lat_e7) - center_lat_e7;
+      int64_t dlon = static_cast<int64_t>(ap.lon_e7) - center_lon_e7;
+      if (dlon > 1800000000LL) dlon -= 3600000000LL;
+      if (dlon < -1800000000LL) dlon += 3600000000LL;
+      if (llabs(dlat) > lat_limit_e7 || llabs(dlon) > lon_limit_e7) {
+        ap_state = 1;
+      } else {
+        float dx_km = 0.0f, dy_km = 0.0f, dist_km = 0.0f;
+        offsetKmFromCenter(e7ToDeg(ap.lat_e7), e7ToDeg(ap.lon_e7),
+                           &dx_km, &dy_km, &dist_km);
+        ap_state = dist_km <= radius_km ? 2 : 1;
+      }
+    }
+    if (ap_state == 1) continue;
+    CachedRunway line = {};
+    if (!projectRunwayLine(rw, &line)) continue;
+    if (s_cached_runway_count >= kMaxCachedRunways) {
+      // Overflow only affects runway geometry caching. Continue collecting
+      // airport identifiers so their label positions can still be cached.
+      s_cache_overflow = true;
+    } else {
+      s_cached_runways[s_cached_runway_count++] = line;
+    }
+    if (ap_state == 2 && s_cached_label_count < kMaxAirportLabels) {
+      ap_state = 3;
+      s_cached_airport_labels[s_cached_label_count++] = ap_idx;
+    }
   }
-  *lx = ax + static_cast<int>(lroundf(dx / len * static_cast<float>(gap)));
-  *ly = ay + static_cast<int>(lroundf(dy / len * static_cast<float>(gap)));
+  positionAirportLabels();
 }
 
 void clipPointOntoOuterRing(int* x, int* y) {
@@ -233,69 +238,184 @@ void clipPointOntoOuterRing(int* x, int* y) {
   *y = cy + static_cast<int>(lroundf(static_cast<float>(dy) * scale));
 }
 
-void drawAirportLabel(lgfx::LGFXBase& gfx,
-                      const data::large_airports::Airport& ap) {
-  int ax = 0;
-  int ay = 0;
-  latLonToScreen(e7ToDeg(ap.lat_e7), e7ToDeg(ap.lon_e7), &ax, &ay);
-  clipPointOntoOuterRing(&ax, &ay);
+struct AirportLabelRect { int x0, y0, x1, y1; };
 
-  int lx = 0;
-  int ly = 0;
-  offsetLabelFromCenter(ax, ay, &lx, &ly);
-  drawBoldRunwayLabel(gfx, ap.ident, lx, ly);
+bool airportRectFitsDisc(const AirportLabelRect& r) {
+  if (r.x0 < 1 || r.y0 < 1 || r.x1 >= radar::kSize-1 ||
+      r.y1 >= radar::kSize-1) return false;
+  constexpr int radius_sq = 115 * 115;
+  for (int x : {r.x0, r.x1}) for (int y : {r.y0, r.y1}) {
+    const int dx = x - radar::kCenterX, dy = y - radar::kCenterY;
+    if (dx*dx + dy*dy > radius_sq) return false;
+  }
+  return true;
+}
+
+bool airportRectsOverlap(const AirportLabelRect& a,
+                         const AirportLabelRect& b, int margin) {
+  return a.x0 < b.x1 + margin && b.x0 < a.x1 + margin &&
+         a.y0 < b.y1 + margin && b.y0 < a.y1 + margin;
+}
+
+// Liang-Barsky segment/rectangle test, with a 3 px line-clearance margin.
+// Used only while recalculating a new range/location, not at 4 Hz.
+bool runwayTouchesAirportLabel(const CachedRunway& l,
+                               const AirportLabelRect& rect) {
+  const float x0 = static_cast<float>(l.x0);
+  const float y0 = static_cast<float>(l.y0);
+  const float dx = static_cast<float>(l.x1 - l.x0);
+  const float dy = static_cast<float>(l.y1 - l.y0);
+  const float left = static_cast<float>(rect.x0 - 3);
+  const float right = static_cast<float>(rect.x1 + 3);
+  const float top = static_cast<float>(rect.y0 - 3);
+  const float bottom = static_cast<float>(rect.y1 + 3);
+  float t0 = 0.0f, t1 = 1.0f;
+  const float ps[4] = {-dx, dx, -dy, dy};
+  const float qs[4] = {x0-left, right-x0, y0-top, bottom-y0};
+  for (int i=0; i<4; ++i) {
+    if (fabsf(ps[i]) < 0.00001f) {
+      if (qs[i] < 0.0f) return false;
+      continue;
+    }
+    const float t = qs[i]/ps[i];
+    if (ps[i] < 0.0f) t0 = std::max(t0,t);
+    else t1 = std::min(t1,t);
+    if (t0 > t1) return false;
+  }
+  return true;
+}
+
+bool airportLabelOverlapsRunway(const AirportLabelRect& r) {
+  for (size_t i=0; i<s_cached_runway_count; ++i) {
+    if (runwayTouchesAirportLabel(s_cached_runways[i],r)) return true;
+  }
+  if (!s_cache_overflow) return false;
+  // Dense-area fallback. Recheck remaining runways only while recalculating
+  // label placement so even the overflow case never covers a landing strip.
+  size_t visible = 0;
+  for (size_t i=0; i<data::large_airports::kRunwayCount; ++i) {
+    CachedRunway line = {};
+    if (!projectRunwayLine(data::large_airports::kRunways[i], &line)) continue;
+    if (visible++ < kMaxCachedRunways) continue;
+    if (runwayTouchesAirportLabel(line,r)) return true;
+  }
+  return false;
+}
+
+void positionAirportLabels() {
+  s_fixed_label_count = 0;
+  for (size_t i=0; i<s_cached_label_count; ++i) {
+    const uint16_t ap_idx = s_cached_airport_labels[i];
+    const auto& ap = data::large_airports::kAirports[ap_idx];
+    const int width = plane_label_font::width(ap.ident, false);
+    const int height = 9;
+    if (width <= 0 || width > 110) continue;
+    int ax=0,ay=0;
+    latLonToScreen(e7ToDeg(ap.lat_e7),e7ToDeg(ap.lon_e7),&ax,&ay);
+    clipPointOntoOuterRing(&ax,&ay);
+    bool placed = false;
+    for (int gap : {8, 15, 23}) {
+      // Nearby first; expand only when the airport's runways block the text.
+      const int x_candidates[8] = {ax-width/2, ax-width/2, ax+gap,
+          ax-width-gap, ax+gap, ax-width-gap, ax+gap, ax-width-gap};
+      const int y_candidates[8] = {ay-height-gap, ay+gap, ay-height/2,
+          ay-height/2, ay-height-gap, ay-height-gap, ay+gap, ay+gap};
+      for (int candidate=0; candidate<8; ++candidate) {
+        AirportLabelRect rect = {x_candidates[candidate],y_candidates[candidate],
+            x_candidates[candidate]+width,y_candidates[candidate]+height};
+        if (!airportRectFitsDisc(rect)) continue;
+        bool overlaps = false;
+        for (size_t existing=0; existing<s_fixed_label_count; ++existing) {
+          const auto& other = s_fixed_labels[existing];
+          const int other_w = plane_label_font::width(
+              data::large_airports::kAirports[other.airport].ident,false);
+          const AirportLabelRect old = {other.x,other.y,other.x+other_w,other.y+9};
+          if (airportRectsOverlap(rect,old,3)) {overlaps=true; break;}
+        }
+        if (overlaps || airportLabelOverlapsRunway(rect)) continue;
+        s_fixed_labels[s_fixed_label_count++] = {ap_idx,
+            static_cast<int16_t>(rect.x0),static_cast<int16_t>(rect.y0)};
+        placed = true;
+        break;
+      }
+      if (placed) break;
+    }
+    // If no runway-free position is available, omit this airport name rather
+    // than paint over a landing strip. Reconsider only when range changes.
+  }
+}
+
+void drawFixedAirportLabels(lgfx::LGFXBase& gfx) {
+  if (!s_fixed_label_count) return;
+  // Our native 6x9 airport font is drawn directly; no VLW font loading.
+  for (size_t i=0;i<s_fixed_label_count;++i) {
+    const auto& label = s_fixed_labels[i];
+    plane_label_font::draw(gfx,label.x,label.y,
+        data::large_airports::kAirports[label.airport].ident,
+        radar::kColorRunwayLabel,false);
+  }
 }
 
 }  // namespace
 
 void drawLargeAirportRunways(lgfx::LGFXBase& gfx) {
-  if (!radar::showRunways()) {
+  if (!radar::showRunways()) return;
+  // The cache key follows exactly the settings that alter runway projection.
+  // Display colors/font choices do not affect geometry and remain live.
+  const float range = radar::fetchRadiusKm();
+  const double lat = services::location::lat();
+  const double lon = services::location::lon();
+  if (!s_cache_valid || s_cache_range != range ||
+      s_cache_lat != lat || s_cache_lon != lon) {
+    rebuildRunwayCache(lat, lon, range);
+  }
+  if (s_cache_overflow) {
+    // Only on unusually dense maps: recompute the full correct set rather
+    // than silently dropping runways past the fixed cache capacity.
+    // Keep the overflow state cached; the fallback still draws every frame.
+    const double center_cos = fabs(cos(lat * kDegToRad));
+    const double safe_cos = center_cos > 0.0001 ? center_cos : 0.0001;
+    const int64_t center_lat_e7 = static_cast<int64_t>(llround(lat * 1e7));
+    const int64_t center_lon_e7 = static_cast<int64_t>(llround(lon * 1e7));
+    const int64_t lat_limit = static_cast<int64_t>(ceil((range / kKmPerDeg + 0.001) * 1e7));
+    const int64_t lon_limit = static_cast<int64_t>(ceil((range / (kKmPerDeg * safe_cos) + 0.001) * 1e7));
+    memset(s_airport_state, 0, sizeof(s_airport_state));
+    uint16_t label_airports[kMaxAirportLabels];
+    size_t label_count = 0;
+    for (size_t i = 0; i < data::large_airports::kRunwayCount; ++i) {
+      const auto& rw = data::large_airports::kRunways[i];
+      const uint16_t ap_idx = rw.airport_idx;
+      uint8_t& state = s_airport_state[ap_idx];
+      if (state == 0) {
+        const auto& ap = data::large_airports::kAirports[ap_idx];
+        const int64_t dlat = static_cast<int64_t>(ap.lat_e7) - center_lat_e7;
+        int64_t dlon = static_cast<int64_t>(ap.lon_e7) - center_lon_e7;
+        if (dlon > 1800000000LL) dlon -= 3600000000LL;
+        if (dlon < -1800000000LL) dlon += 3600000000LL;
+        if (llabs(dlat) > lat_limit || llabs(dlon) > lon_limit) state = 1;
+        else {
+          float dx = 0, dy = 0, d = 0;
+          offsetKmFromCenter(e7ToDeg(ap.lat_e7), e7ToDeg(ap.lon_e7), &dx, &dy, &d);
+          state = d <= range ? 2 : 1;
+        }
+      }
+      if (state == 1) continue;
+      CachedRunway line = {};
+      if (!projectRunwayLine(rw, &line)) continue;
+      drawProjectedRunway(gfx, line);
+      if (state == 2 && label_count < kMaxAirportLabels) {
+        state = 3;
+        label_airports[label_count++] = ap_idx;
+      }
+    }
+    // Airport-name positions are frozen for this range, even in overflow.
+    drawFixedAirportLabels(gfx);
     return;
   }
-  displayFontEnsureLoaded(gfx);
-  const float radius_km = radar::fetchRadiusKm();
-
-  uint16_t label_airports[kMaxAirportLabels];
-  size_t label_count = 0;
-
-  for (size_t i = 0; i < data::large_airports::kAirportCount; ++i) {
-    s_in_range[i] = false;
-    s_label_pending[i] = false;
+  for (size_t i = 0; i < s_cached_runway_count; ++i) {
+    drawProjectedRunway(gfx, s_cached_runways[i]);
   }
-
-  for (size_t i = 0; i < data::large_airports::kRunwayCount; ++i) {
-    const auto& rw = data::large_airports::kRunways[i];
-    const uint16_t ap_idx = rw.airport_idx;
-    if (!s_in_range[ap_idx]) {
-      const auto& ap = data::large_airports::kAirports[ap_idx];
-      float dx_km = 0.0f;
-      float dy_km = 0.0f;
-      float dist_km = 0.0f;
-      offsetKmFromCenter(e7ToDeg(ap.lat_e7), e7ToDeg(ap.lon_e7), &dx_km, &dy_km,
-                         &dist_km);
-      s_in_range[ap_idx] = (dist_km <= radius_km);
-    }
-    if (!s_in_range[ap_idx]) {
-      continue;
-    }
-    if (!drawRunwayLine(gfx, rw)) {
-      continue;
-    }
-    if (!s_label_pending[ap_idx] && label_count < kMaxAirportLabels) {
-      s_label_pending[ap_idx] = true;
-      label_airports[label_count++] = ap_idx;
-    }
-  }
-
-  if (label_count == 0) {
-    return;
-  }
-
-  initRunwayLabelStyle(gfx);
-  applyRunwayLabelStyle(gfx);
-  for (size_t i = 0; i < label_count; ++i) {
-    drawAirportLabel(gfx, data::large_airports::kAirports[label_airports[i]]);
-  }
+  drawFixedAirportLabels(gfx);
 }
 
 }  // namespace ui::runway
