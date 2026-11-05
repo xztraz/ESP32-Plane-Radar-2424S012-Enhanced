@@ -25,37 +25,33 @@ constexpr unsigned long kWifiReconnectIntervalMs = 15000;
 
 // --- BOOT button (ESP32-C3 Super Mini, active LOW) ---
 constexpr gpio_num_t kBootPin = GPIO_NUM_9;
-constexpr unsigned long kBootResetHoldMs = 3000UL;
+constexpr unsigned long kBootResetHoldMs = 20000UL;
 /** Ignore BOOT taps shorter than this (debounce). */
 constexpr unsigned long kBootTapMinMs = 40UL;
 
 // --- Display: GC9A01 1.28" round 240×240 (SPI) ---
-constexpr gpio_num_t kDisplayPinRst = GPIO_NUM_0;
-constexpr gpio_num_t kDisplayPinCs = GPIO_NUM_1;
-constexpr gpio_num_t kDisplayPinDc = GPIO_NUM_10;
-constexpr gpio_num_t kDisplayPinMosi = GPIO_NUM_3;  // display SDA
-constexpr gpio_num_t kDisplayPinSclk = GPIO_NUM_4;  // display SCL
+constexpr gpio_num_t kDisplayPinRst = static_cast<gpio_num_t>(-1);
+constexpr gpio_num_t kDisplayPinCs = GPIO_NUM_10;
+constexpr gpio_num_t kDisplayPinDc = GPIO_NUM_2;
+constexpr gpio_num_t kDisplayPinMosi = GPIO_NUM_7;  // display SDA
+constexpr gpio_num_t kDisplayPinSclk = GPIO_NUM_6;  // display SCL
 
 constexpr int kDisplayWidth = 240;
 constexpr int kDisplayHeight = 240;
 
-constexpr uint32_t kDisplaySpiWriteHz = 40000000;
+constexpr uint32_t kDisplaySpiWriteHz = 80000000;  // 80 MHz GC9A01 SPI.
 // GC9A01 modules often need invert + BGR for correct black/green output
 constexpr bool kDisplayInvert = true;
-constexpr bool kDisplayRgbOrder = true;
+constexpr bool kDisplayRgbOrder = false;
 
-// --- Radar center defaults (overridden via WiFi setup portal) ---
-constexpr double kDefaultRadarLat = 52.3676;
-constexpr double kDefaultRadarLon = 4.9041;
+// --- Public example location (configure your own in the setup portal) ---
+constexpr double kDefaultRadarLat = 52.229676;
+constexpr double kDefaultRadarLon = 21.012229;
 
 /** Poll adsb.fi (API public limit: 1 req/s). */
 constexpr unsigned long kAdsbFetchIntervalMs = 5000;
-/** Redraw cadence; aircraft are dead-reckoned along their track/speed so motion
- *  is smooth. ~4 Hz = 250 ms (panel scanout caps at ~24 Hz; the full-frame
- *  recompose+present is the practical limit ~10-15 Hz). */
-constexpr unsigned long kRadarRedrawIntervalMs = 250;
-/** Legacy scale unused — fetch uses radar::fetchRadiusKm() to screen edge. */
-constexpr float kAdsbFetchRadiusScale = 1.0f;
+// Radar cadence is range-dependent; see ui::radar::kRangePresets in
+// include/ui/radar_range.h. ADS-B polling stays at 5000 ms independently.
 /** false = hide aircraft with alt_baro "ground"; true = show them too. */
 constexpr bool kAdsbShowGroundAircraft = false;
 

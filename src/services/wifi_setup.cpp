@@ -1,29 +1,44 @@
 #include "services/wifi_setup.h"
 
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <WiFiManager.h>
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 
 #include <Preferences.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <esp32-hal-cpu.h>
 
 #ifdef WM_MDNS
 #include <ESPmDNS.h>
 #endif
 
 #include "config.h"
+#include "firmware_version.h"
 #include "services/radar_location.h"
+#include "services/aircraft_style_settings.h"
+#include "services/aircraft_watchlist.h"
 #include "ui/radar_range.h"
+#include "ui/aircraft_altitude_units.h"
+#include "ui/aircraft_trail_settings.h"
+#include "ui/radar_display_options.h"
 #include "ui/status_screens.h"
+#include "ui/radar_display.h"
+#include "services/adsb_client.h"
+#include "services/radar_web_pages.h"
+#include "services/fetch_save_gate.h"
+#include <WebServer.h>
 
 portMUX_TYPE s_boot_mux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool s_boot_tap_pending = false;
 volatile bool s_boot_is_down = false;
 volatile unsigned long s_boot_down_ms = 0;
 bool s_long_press_handled = false;
+volatile uint8_t s_boot_reset_seconds = 0;
 bool s_boot_interrupt_attached = false;
 
 void IRAM_ATTR onBootButtonIsr() {
@@ -62,62 +77,476 @@ constexpr char kPrefsForcePortalKey[] = "portal";
 bool s_force_config_portal = false;
 WiFiManager s_wm;
 bool s_wm_configured = false;
+// An active WiFiManager portal flag does not prove that TCP port 80 is
+// listening. Check the local listener infrequently and recover if it fails
+// twice in a row. No extra FreeRTOS task or persistent socket is required.
+constexpr uint32_t kWebProbeIntervalMs = 15000u;
+constexpr uint32_t kWebStartupGraceMs = 8000u;
+uint32_t s_web_started_ms = 0;
+uint32_t s_web_last_probe_ms = 0;
+uint8_t s_web_probe_failures = 0;
+uint32_t s_web_last_start_attempt_ms = 0;
+
+// Bounded, non-blocking Wi-Fi work window. The main loop continues
+// serving HTTP and the BOOT button; only radar painting and new ADS-B HTTPS
+// transfers are paused. Atomic flags coordinate the ADS-B FreeRTOS task.
+constexpr uint32_t kWifiPauseWindowMs = 45000UL;
+constexpr uint32_t kWifiPauseHardLimitMs = 120000UL;
+std::atomic<uint32_t> s_wifi_pause_started_ms{0};
+std::atomic<uint32_t> s_wifi_pause_until_ms{0};
+std::atomic<bool> s_adsb_fetch_active{false};
+services::FetchSaveGate s_fetch_save_gate;
+
+bool radarWorkPausedInternal() {
+  const uint32_t until = s_wifi_pause_until_ms.load();
+  if (!until) return false;
+  const uint32_t now = millis();
+  const uint32_t started = s_wifi_pause_started_ms.load();
+  return static_cast<int32_t>(until - now) > 0 &&
+         static_cast<uint32_t>(now - started) < kWifiPauseHardLimitMs;
+}
+
+void beginWifiWork() {
+  const uint32_t now = millis();
+  if (!radarWorkPausedInternal()) {
+    s_wifi_pause_started_ms.store(now);
+    Serial.println("Wi-Fi setup: pausing radar rendering and new ADS-B requests");
+  }
+  s_wifi_pause_until_ms.store(now + kWifiPauseWindowMs);
+}
+
+void keepWifiWorkAlive() {
+  if (radarWorkPausedInternal()) {
+    s_wifi_pause_until_ms.store(millis() + kWifiPauseWindowMs);
+  }
+}
+
+void finishWifiWork() {
+  if (radarWorkPausedInternal()) Serial.println("Wi-Fi setup: radar resumes");
+  s_wifi_pause_until_ms.store(0);
+}
 
 void ensureWifiManager();
 void startLanWebPortal();
 void stopLanWebPortal();
 bool wifiLinkUp();
 
-constexpr int kCoordParamLen = 20;
-constexpr char kCoordInputAttrs[] =
-    " type=\"number\" step=\"0.000001\"";
-
-WiFiManagerParameter s_param_lat("radar_lat", "Latitude (deg)", "0",
-                                kCoordParamLen, kCoordInputAttrs);
-WiFiManagerParameter s_param_lon("radar_lon", "Longitude (deg)", "0",
-                                kCoordParamLen, kCoordInputAttrs);
-
-char s_miles_checkbox_attrs[32] = "type=\"checkbox\"";
-WiFiManagerParameter s_param_miles("use_miles", "Display distances in miles", "T", 2,
-                                   s_miles_checkbox_attrs, WFM_LABEL_AFTER);
-
-char s_runways_checkbox_attrs[32] = "type=\"checkbox\"";
-WiFiManagerParameter s_param_runways("show_runways", "Show airport runways", "T", 2,
-                                     s_runways_checkbox_attrs, WFM_LABEL_AFTER);
-
-void refreshPortalParamValues() {
-  char lat_buf[kCoordParamLen + 1];
-  char lon_buf[kCoordParamLen + 1];
-  snprintf(lat_buf, sizeof(lat_buf), "%.6f", services::location::lat());
-  snprintf(lon_buf, sizeof(lon_buf), "%.6f", services::location::lon());
-  s_param_lat.setValue(lat_buf, kCoordParamLen);
-  s_param_lon.setValue(lon_buf, kCoordParamLen);
-  snprintf(s_miles_checkbox_attrs, sizeof(s_miles_checkbox_attrs), "type=\"checkbox\"%s",
-           ui::radar::useMiles() ? " checked" : "");
-  s_param_miles.setValue("T", 2);
-  snprintf(s_runways_checkbox_attrs, sizeof(s_runways_checkbox_attrs),
-           "type=\"checkbox\"%s", ui::radar::showRunways() ? " checked" : "");
-  s_param_runways.setValue("T", 2);
-}
-
-void onPortalParamsSaved() {
-  if (!services::location::saveFromStrings(s_param_lat.getValue(),
-                                           s_param_lon.getValue())) {
-    Serial.println("Invalid lat/lon in portal — keeping previous location");
+// Keep WiFiManager only for Wi-Fi credentials and captive-portal
+// handling. Radar pages are independent, statically-served routes. The V16
+// custom WiFiManager parameter form used to concatenate ~4 KB watchlist state,
+// style settings, and a large JavaScript UI into every /param response.
+// WiFiManager 2.0.x has setCustomHeadElement(), but no
+// setCustomBodyHeader(). Add a tiny navigation bar to its Wi-Fi pages after
+// DOMContentLoaded; radar pages have their own navigation in flash-resident
+// HTML. Do not allocate a large dynamic string for this menu.
+constexpr char kWifiNavigationHead[] = R"radarnav(<link rel="stylesheet" href="/assets/radar.css">
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  document.body.classList.add('plane-radar-wifi');
+  if (document.getElementById('plane-radar-links')) return;
+  var menu = document.createElement('nav');
+  menu.id = 'plane-radar-links';
+  menu.setAttribute('aria-label', 'Plane Radar navigation');
+  [['General','/general'],['Aircraft','/aircraft'],['Wi-Fi','/wifi-settings'],['Status','/status']]
+    .forEach(function (item) {
+      var link = document.createElement('a');
+      link.href = item[1];
+      link.textContent = item[0];
+      if (item[0] === 'Wi-Fi') link.className = 'active';
+      menu.appendChild(link);
+    });
+  if (document.body) document.body.insertBefore(menu, document.body.firstChild);
+  // WiFiManager retains control of the scan and credential forms.
+  if (location.pathname === '/wifi' || location.pathname === '/wifinoscan') {
+    setInterval(function () {
+      if (document.visibilityState === 'visible')
+        fetch('/api/wifi/ping', {cache:'no-store'}).catch(function () {});
+    }, 10000);
   }
-  ui::radar::saveMilesFromPortal(s_param_miles.getValue());
-  ui::radar::saveRunwaysFromPortal(s_param_runways.getValue());
+});
+</script>)radarnav";
 
-  refreshPortalParamValues();
+// The Wi-Fi tab is lightweight. Opening it never starts a scan or allocates
+// network lists. Users opt into scanning or manual network configuration.
+const char kWifiSettingsHtml[] PROGMEM = R"rdr(<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Plane Radar - Wi-Fi</title><link rel="stylesheet" href="/assets/radar.css"></head>
+<body><h1>Plane Radar</h1><nav><a href="/general">General</a><a href="/aircraft">Aircraft</a><a href="/wifi-settings" class="active">Wi-Fi</a><a href="/status">Status</a></nav>
+<section><h2>Wi-Fi settings</h2><p>Connected network: <strong id="ssid">Loading...</strong></p>
+<p>Transmit power: 8.5 dBm (unchanged).</p>
+<p>Network scanning uses additional RAM. It is started only when you request it; aircraft drawing and new ADS-B downloads pause briefly during configuration.</p>
+<p><a href="/wifi-prepare">Scan available Wi-Fi networks</a></p>
+<p><a href="/wifi-prepare?manual=1">Enter network name manually (no scan)</a></p>
+<p><a href="/general">Return to radar settings</a></p></section>
+<script>fetch('/api/wifi/ssid',{cache:'no-store'}).then(function(r){return r.text();}).then(function(s){document.getElementById('ssid').textContent=s || '(not connected)';}).catch(function(){document.getElementById('ssid').textContent='Unavailable';});</script>
+</body></html>)rdr";
+
+const char kWifiPrepareHtml[] PROGMEM = R"rdr(<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Plane Radar - Wi-Fi</title><link rel="stylesheet" href="/assets/radar.css"></head>
+<body><h1>Plane Radar</h1><nav><a href="/general">General</a><a href="/aircraft">Aircraft</a><a href="/wifi-settings" class="active">Wi-Fi</a><a href="/status">Status</a></nav>
+<section><h2>Wi-Fi configuration</h2><p id="message">Pausing radar and finishing the current aircraft download before scanning for networks...</p>
+<p><a href="/general">Cancel and resume radar</a></p>
+<div id="fallback" hidden><p>Aircraft download did not finish promptly. To avoid locking up the radar, a network scan was not started.</p>
+<p><a href="/wifinoscan">Enter network manually (without a scan)</a></p>
+<p><a href="/wifi-prepare">Retry network scan</a></p></div></section>
+<script>
+(function () {
+  var began = Date.now();
+  function check() {
+    fetch('/api/wifi/ready', {cache:'no-store'}).then(function (r) {return r.json();}).then(function (s) {
+      if (s.ready) {location.replace(location.search.indexOf('manual=1') >= 0 ? '/wifinoscan' : '/wifi'); return;}
+      if (Date.now()-began > 15000) {document.getElementById('message').textContent='The radar is still busy.';document.getElementById('fallback').hidden=false;return;}
+      setTimeout(check,500);
+    }).catch(function () {
+      if (Date.now()-began < 15000) setTimeout(check,700);
+      else {document.getElementById('message').textContent='Wi-Fi configuration is temporarily unavailable.';document.getElementById('fallback').hidden=false;}
+    });
+  }
+  check();
+})();
+</script></body></html>)rdr";
+
+uint32_t s_last_web_us = 0;
+// A short, non-blocking pause after serving a radar web response gives the
+// browser time to load settings/assets without competing with GC9A01 drawing.
+// HTTP callbacks run on main, and wifiLoop() stays first in every iteration.
+constexpr uint32_t kWebDisplayYieldMs = 650;
+std::atomic<uint32_t> s_last_web_served_ms{0};
+
+void noteWebResponse() {
+  s_last_web_served_ms.store(millis(), std::memory_order_relaxed);
 }
 
-void attachPortalParams(WiFiManager& wm) {
-  refreshPortalParamValues();
-  wm.addParameter(&s_param_lat);
-  wm.addParameter(&s_param_lon);
-  wm.addParameter(&s_param_miles);
-  wm.addParameter(&s_param_runways);
-  wm.setSaveParamsCallback(onPortalParamsSaved);
+
+void sendStatic(const char* contents, const char* content_type) {
+  // Flash-resident static responses: no large temporary String allocations.
+  // Avoid serving stale JS/CSS after a firmware update while debugging portal
+  // compatibility. We can enable immutable versioned asset caching later.
+  s_wm.server->sendHeader("Cache-Control", "no-store");
+  s_wm.server->send_P(200, content_type, contents);
+  noteWebResponse();
+}
+
+void sendNoCache(int status, const char* type, const String& body,
+                 bool defer_rendering = true) {
+  s_wm.server->sendHeader("Cache-Control", "no-store");
+  s_wm.server->send(status, type, body);
+  if (defer_rendering) noteWebResponse();
+}
+
+// All web POST handlers run on the single WiFiManager loop. The ADS-B
+// connection runs on a separate task. Serialize *writes* against the full
+// HTTPS request so large TLS allocations never overlap NVS commits.
+// If TLS is active, return immediately and let the page retry after a delay.
+class SaveGuard {
+ public:
+  SaveGuard() : acquired_(s_fetch_save_gate.tryBeginSave(millis())) {}
+  ~SaveGuard() { if (acquired_) s_fetch_save_gate.endSave(millis()); }
+  bool acquired() const { return acquired_; }
+  SaveGuard(const SaveGuard&) = delete;
+  SaveGuard& operator=(const SaveGuard&) = delete;
+ private:
+  bool acquired_;
+};
+
+void sendSaveBusy() {
+  s_wm.server->sendHeader("Retry-After", "1");
+  sendNoCache(503, "text/plain", "ADS-B download busy; save will retry");
+}
+
+bool isChecked(const String& val) { return val == "1"; }
+
+void handleGeneralGet() {
+  const uint32_t start = micros();
+  char response[224];
+  snprintf(response, sizeof(response),
+           "{\"lat\":%.6f,\"lon\":%.6f,\"range\":%u,\"bgtheme\":%u,\"bgpattern\":%u,\"miles\":%s,"
+           "\"runways\":%s,\"metres\":%s}",
+           services::location::lat(), services::location::lon(),
+           static_cast<unsigned>(ui::radar::rangeIndex()),
+           static_cast<unsigned>(ui::radar::backgroundTheme()),
+           static_cast<unsigned>(ui::radar::backgroundPattern()),
+           ui::radar::useMiles() ? "true" : "false",
+           ui::radar::showRunways() ? "true" : "false",
+           ui::altitude_units::meters() ? "true" : "false");
+  // Diagnostics polling must not pause radar rendering for 650 ms.
+  sendNoCache(200, "application/json", response, false);
+  s_last_web_us = micros() - start;
+}
+
+void handleGeneralPost() {
+  const uint32_t start = micros();
+  if (!s_wm.server->hasArg("lat") || !s_wm.server->hasArg("lon") ||
+      !s_wm.server->hasArg("range") || !s_wm.server->hasArg("bgtheme") ||
+      !s_wm.server->hasArg("bgpattern")) {
+    sendNoCache(400, "text/plain", "Missing location/range"); return;
+  }
+  const String index_text = s_wm.server->arg("range");
+  if (index_text.length() != 1 || index_text[0] < '0' ||
+      index_text[0] >= '0' + ui::radar::kRangePresetCount) {
+    sendNoCache(400, "text/plain", "Invalid radar range"); return;
+  }
+  const String lat = s_wm.server->arg("lat");
+  const String lon = s_wm.server->arg("lon");
+  const String bgtheme = s_wm.server->arg("bgtheme");
+  const String bgpattern = s_wm.server->arg("bgpattern");
+  if (bgtheme.length() != 1 || bgtheme[0] < '0' || bgtheme[0] > '5' ||
+      bgpattern.length() != 1 || bgpattern[0] < '0' || bgpattern[0] > '5') {
+    sendNoCache(400, "text/plain", "Invalid radar color/pattern"); return;
+  }
+  SaveGuard save_guard;
+  if (!save_guard.acquired()) { sendSaveBusy(); return; }
+  if (!services::location::saveFromStrings(lat.c_str(), lon.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid latitude/longitude"); return;
+  }
+  ui::radar::rangeSetIndex(static_cast<uint8_t>(index_text[0] - '0'));
+  ui::radar::saveBackgroundTheme(static_cast<uint8_t>(bgtheme[0] - '0'));
+  ui::radar::saveBackgroundPattern(static_cast<uint8_t>(bgpattern[0] - '0'));
+  ui::radar::saveMilesFromPortal(isChecked(s_wm.server->arg("miles")) ? "T" : "");
+  ui::radar::saveRunwaysFromPortal(isChecked(s_wm.server->arg("runways")) ? "T" : "");
+  ui::altitude_units::save(isChecked(s_wm.server->arg("metres")) ? "m" : "ft");
+  ui::radarDisplayThemeChanged();
+  sendNoCache(200, "text/plain", "Saved");
+  s_last_web_us = micros() - start;
+}
+
+void handleAircraftGet() {
+  const uint32_t start = micros();
+  // The watchlist string is only generated when this particular page opens.
+  String result;
+  result.reserve(4300);
+  result += services::aircraft_styles::encoded();
+  result += '\n';
+  result += ui::display_options::encoded();
+  result += '\n';
+  result += String(ui::trails::points());
+  result += '\n';
+  result += services::watchlist::encoded();
+  result += '\n';
+  result += String(ui::trails::startDarkeningPercent());
+  result += '\n';
+  result += String(ui::trails::fadeCurve());
+  sendNoCache(200, "text/plain; charset=utf-8", result);
+  s_last_web_us = micros() - start;
+}
+
+void handleAircraftPost() {
+  const uint32_t start = micros();
+  auto* server = s_wm.server.get();
+  if (!server->hasArg("colors") || !server->hasArg("options") ||
+      !server->hasArg("trail") || !server->hasArg("trailDark") ||
+      !server->hasArg("trailCurve") || !server->hasArg("watchlist")) {
+    sendNoCache(400, "text/plain", "Missing aircraft settings"); return;
+  }
+  const String colors = server->arg("colors");
+  const String options = server->arg("options");
+  const String trail = server->arg("trail");
+  const String trailDark = server->arg("trailDark");
+  const String trailCurve = server->arg("trailCurve");
+  const String watches = server->arg("watchlist");
+  if (colors.length() > 48 || options.length() > 24 ||
+      trail.length() > 3 || trailDark.length() > 3 ||
+      trailCurve.length() > 2 || watches.length() > 3700) {
+    sendNoCache(400, "text/plain", "Aircraft settings too long"); return;
+  }
+  // Keep web settings writes out of the TLS handshake/parse lifetime.
+  SaveGuard save_guard;
+  if (!save_guard.acquired()) { sendSaveBusy(); return; }
+  // Each save validates its own input before touching NVS, retaining existing
+  // values when malformed. The browser submits all aircraft settings at once.
+  if (!services::aircraft_styles::save(colors.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid aircraft colors/priority"); return;
+  }
+  if (!ui::display_options::save(options.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid label/icon options"); return;
+  }
+  if (!ui::trails::saveFromPortal(trail.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid trail points"); return;
+  }
+  if (!ui::trails::saveStartDarkeningPercent(trailDark.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid trail start darkening"); return;
+  }
+  if (!ui::trails::saveFadeCurve(trailCurve.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid trail fade curve"); return;
+  }
+  if (!services::watchlist::save(watches.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid watchlist"); return;
+  }
+  ui::radarDisplayInvalidateSlowLayer();
+  sendNoCache(200, "text/plain", "Saved");
+  s_last_web_us = micros() - start;
+}
+
+void handleStatusGet() {
+  const uint32_t start = micros();
+  char response[820];
+  const ui::RadarFrameTimings timing = ui::radarDisplayFrameTimings();
+  const ui::RadarSpiSlowDiag slow_spi = ui::radarDisplaySpiSlowDiag();
+  const unsigned long last = services::adsb::lastUpdateMs();
+  char age[22];
+  if (!last) {
+    strcpy(age, "null");
+  } else {
+    snprintf(age, sizeof(age), "%lu", millis() - last);
+  }
+  snprintf(response, sizeof(response),
+      "{\"version\":\"%s\",\"rssi\":%d,\"heap\":%lu,\"minheap\":%lu,\"count\":%u,"
+      "\"fetchAgeMs\":%s,\"frameIntervalMs\":%u,\"renderUs\":%lu,\"slowUs\":%lu,\"webUs\":%lu,\"frames\":%u,\"largestHeap\":%lu,"
+      "\"gridUs\":%lu,\"runwaysUs\":%lu,\"projectionUs\":%lu,"
+      "\"trailsUs\":%lu,\"dotsUs\":%lu,\"labelsUs\":%lu,"
+      "\"iconsUs\":%lu,\"transferUs\":%lu,"
+      "\"flashGrid\":%u,\"flashCopyUs\":%lu,"
+      "\"cpuMhz\":%lu,\"frameCpuStart\":%u,\"frameCpuEnd\":%u,"
+      "\"slowSpiCount\":%lu,\"slowSpiCpuStart\":%u,\"slowSpiCpuEnd\":%u,\"slowSpiUs\":%lu}",
+      firmware::kVersion, WiFi.RSSI(), static_cast<unsigned long>(ESP.getFreeHeap()),
+      static_cast<unsigned long>(ESP.getMinFreeHeap()),
+      static_cast<unsigned>(services::adsb::aircraftCount()), age,
+      static_cast<unsigned>(ui::radar::redrawIntervalMs()),
+      static_cast<unsigned long>(ui::radarDisplayLastRenderUs()),
+      static_cast<unsigned long>(ui::radarDisplayLastSlowRenderUs()),
+      static_cast<unsigned long>(s_last_web_us),
+      static_cast<unsigned>(ui::radarDisplayFramebufferCount()),
+      static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+      static_cast<unsigned long>(timing.grid_us),
+      static_cast<unsigned long>(timing.runways_us),
+      static_cast<unsigned long>(timing.projection_us),
+      static_cast<unsigned long>(timing.trails_us),
+      static_cast<unsigned long>(timing.dots_us),
+      static_cast<unsigned long>(timing.labels_us),
+      static_cast<unsigned long>(timing.icons_us),
+      static_cast<unsigned long>(timing.transfer_us),
+      static_cast<unsigned>(ui::radarDisplayFlashGridActive()),
+      static_cast<unsigned long>(timing.flash_copy_us),
+      static_cast<unsigned long>(getCpuFrequencyMhz()),
+      static_cast<unsigned>(timing.cpu_mhz_frame_start),
+      static_cast<unsigned>(timing.cpu_mhz_frame_end),
+      static_cast<unsigned long>(slow_spi.count),
+      static_cast<unsigned>(slow_spi.cpu_mhz_start),
+      static_cast<unsigned>(slow_spi.cpu_mhz_end),
+      static_cast<unsigned long>(slow_spi.last_transfer_us));
+  // Diagnostics polling must not pause radar rendering for 650 ms.
+  sendNoCache(200, "application/json", response, false);
+  s_last_web_us = micros() - start;
+}
+
+void bindRadarRoutes() {
+  if (!s_wm.server) return;
+  s_wm.server->on("/wifi-settings", HTTP_GET, []() {
+    if (wifiLinkUp()) {
+      finishWifiWork();
+      sendStatic(kWifiSettingsHtml, "text/html; charset=utf-8");
+    } else {
+      s_wm.server->sendHeader("Location", "/wifi");
+      s_wm.server->send(302, "text/plain", "Wi-Fi setup");
+    }
+  });
+  s_wm.server->on("/api/wifi/ssid", HTTP_GET, []() {
+    sendNoCache(200, "text/plain; charset=utf-8", WiFi.SSID());
+  });
+  // Wi-Fi prep never performs a scan in the HTTP callback. The existing
+  // WiFiManager /wifi endpoint is opened only after ADS-B TLS is idle.
+  s_wm.server->on("/wifi-prepare", HTTP_GET, []() {
+    if (wifiLinkUp()) {
+      beginWifiWork();
+      sendStatic(kWifiPrepareHtml, "text/html; charset=utf-8");
+    } else {
+      // During captive AP setup, the radar is not fetching data yet.
+      s_wm.server->sendHeader("Location", "/wifi");
+      s_wm.server->send(302, "text/plain", "Wi-Fi setup");
+    }
+  });
+  s_wm.server->on("/api/wifi/ready", HTTP_GET, []() {
+    char result[80];
+    const bool active = radarWorkPausedInternal();
+    const bool fetching = s_adsb_fetch_active.load();
+    snprintf(result, sizeof(result),
+             "{\"paused\":%s,\"fetching\":%s,\"ready\":%s}",
+             active ? "true" : "false", fetching ? "true" : "false",
+             (active && !fetching) ? "true" : "false");
+    sendNoCache(200, "application/json", result);
+  });
+  s_wm.server->on("/api/wifi/ping", HTTP_GET, []() {
+    keepWifiWorkAlive();
+    sendNoCache(200, "text/plain", "OK");
+  });
+  s_wm.server->on("/api/wifi/resume", HTTP_GET, []() {
+    finishWifiWork();
+    sendNoCache(200, "text/plain", "OK");
+  });
+  // Called by WiFiManager when its server has started (LAN or captive AP).
+  // All handlers run in wifiLoop() on the main loop, no second webserver/task.
+  // Register this BEFORE WiFiManager adds its own root route. Its embedded
+  // webserver uses the first matching route. Do not allow a generic captive-
+  // portal landing page to substitute an unusable address for the LAN home.
+  // The LAN home serves General directly: no DNS/mDNS or absolute redirects.
+  s_wm.server->on("/", HTTP_GET, []() {
+    finishWifiWork();
+    if (wifiLinkUp()) {
+      sendStatic(services::radar_web_pages::kGeneral,
+                 "text/html; charset=utf-8");
+    } else {
+      // During first-time setup, continue exposing WiFiManager's /wifi route.
+      s_wm.server->sendHeader("Cache-Control", "no-store");
+      s_wm.server->send(200, "text/html; charset=utf-8",
+          "<!doctype html><html><head><meta name='viewport' "
+          "content='width=device-width,initial-scale=1'>"
+          "<title>Plane Radar Setup</title>"
+          "<link rel='stylesheet' href='/assets/radar.css'></head><body>"
+          "<h1>Plane Radar</h1>"
+          "<nav><a href='/general'>General</a><a href='/aircraft'>Aircraft</a>"
+          "<a href='/wifi' class='active'>Wi-Fi</a><a href='/status'>Status</a></nav>"
+          "<section><h2>Initial Wi-Fi setup</h2>"
+          "<p>Connect this radar to your Wi-Fi network.</p>"
+          "<p><a href='/wifi'>Configure Wi-Fi</a></p>"
+          "</section></body></html>");
+    }
+  });
+  // Ultra-lightweight test: distinguishes name-resolution / routing errors
+  // from a busy server and works without loading any JavaScript.
+  s_wm.server->on("/health", HTTP_GET, []() {
+    s_wm.server->sendHeader("Cache-Control", "no-store");
+    s_wm.server->send(200, "text/plain; charset=utf-8",
+                      "Plane Radar web server OK\n");
+    noteWebResponse();
+  });
+  s_wm.server->on("/general", HTTP_GET, []() {
+    finishWifiWork();
+    sendStatic(services::radar_web_pages::kGeneral, "text/html; charset=utf-8");
+  });
+  s_wm.server->on("/aircraft", HTTP_GET, []() {
+    finishWifiWork();
+    sendStatic(services::radar_web_pages::kAircraft, "text/html; charset=utf-8");
+  });
+  s_wm.server->on("/status", HTTP_GET, []() {
+    finishWifiWork();
+    sendStatic(services::radar_web_pages::kStatus, "text/html; charset=utf-8");
+  });
+  s_wm.server->on("/assets/radar.css", HTTP_GET, []() {
+    sendStatic(services::radar_web_pages::kCss, "text/css; charset=utf-8");
+  });
+  s_wm.server->on("/assets/general.js", HTTP_GET, []() {
+    sendStatic(services::radar_web_pages::kGeneralJs, "application/javascript; charset=utf-8");
+  });
+  s_wm.server->on("/assets/aircraft.js", HTTP_GET, []() {
+    sendStatic(services::radar_web_pages::kAircraftJs, "application/javascript; charset=utf-8");
+  });
+  s_wm.server->on("/assets/status.js", HTTP_GET, []() {
+    sendStatic(services::radar_web_pages::kStatusJs, "application/javascript; charset=utf-8");
+  });
+  // Small readiness probe prevents resending a large watchlist POST while a
+  // TLS handshake owns the internal heap. The POST also checks the same gate.
+  s_wm.server->on("/api/save-ready", HTTP_GET, []() {
+    const bool ready = s_fetch_save_gate.reserveSaveWindow(millis());
+    if (!ready) s_wm.server->sendHeader("Retry-After", "1");
+    sendNoCache(ready ? 200 : 503, "text/plain",
+                ready ? "Ready" : "ADS-B download busy", false);
+  });
+  s_wm.server->on("/api/general", HTTP_GET, handleGeneralGet);
+  s_wm.server->on("/api/general", HTTP_POST, handleGeneralPost);
+  s_wm.server->on("/api/aircraft", HTTP_GET, handleAircraftGet);
+  s_wm.server->on("/api/aircraft", HTTP_POST, handleAircraftPost);
+  s_wm.server->on("/api/status", HTTP_GET, handleStatusGet);
 }
 
 void markForceConfigPortal() {
@@ -203,13 +632,13 @@ void onConfigPortalApStarted(WiFiManager*) {
 #ifdef WM_MDNS
   if (MDNS.begin(config::kPortalHostname)) {
     MDNS.addService("http", "tcp", 80);
-    Serial.printf("Setup portal: http://%s.local (or http://%s)\n",
+    Serial.printf("Setup portal: http://%s.local (or http://%s)\r\n",
                   config::kPortalHostname, config::kPortalIp);
   } else {
-    Serial.printf("Setup portal: http://%s (mDNS unavailable)\n", config::kPortalIp);
+    Serial.printf("Setup portal: http://%s (mDNS unavailable)\r\n", config::kPortalIp);
   }
 #else
-  Serial.printf("Setup portal: http://%s\n", config::kPortalIp);
+  Serial.printf("Setup portal: http://%s\r\n", config::kPortalIp);
 #endif
 }
 
@@ -219,6 +648,8 @@ bool wifiLinkUp() {
 }
 
 void ensureWifiManager() {
+  services::aircraft_styles::init();
+  services::watchlist::init();
   if (s_wm_configured) {
     return;
   }
@@ -227,7 +658,9 @@ void ensureWifiManager() {
                            IPAddress(255, 255, 255, 0));
   s_wm.setHostname(config::kPortalHostname);
   s_wm.setAPCallback(onConfigPortalApStarted);
-  attachPortalParams(s_wm);
+  s_wm.setCustomHeadElement(kWifiNavigationHead);
+  s_wm.setTitle("Plane Radar Wi-Fi");
+  s_wm.setWebServerCallback(bindRadarRoutes);
   s_wm_configured = true;
 }
 
@@ -236,7 +669,11 @@ void startLanWebPortal() {
       s_wm.getConfigPortalActive()) {
     return;
   }
-  refreshPortalParamValues();
+  // When allocation/startup fails, don't retry on every 10-ms main loop.
+  const uint32_t now = millis();
+  if (s_web_last_start_attempt_ms &&
+      static_cast<uint32_t>(now - s_web_last_start_attempt_ms) < 5000u) return;
+  s_web_last_start_attempt_ms = now ? now : 1u;
   WiFi.mode(WIFI_STA);
   s_wm.setConfigPortalBlocking(false);
 #ifdef WM_MDNS
@@ -246,8 +683,21 @@ void startLanWebPortal() {
   }
 #endif
   s_wm.startWebPortal();
-  Serial.printf("LAN config: http://%s.local or http://%s\n",
-                config::kPortalHostname, WiFi.localIP().toString().c_str());
+  s_web_started_ms = s_wm.getWebPortalActive() ? millis() : 0;
+  if (!s_wm.getWebPortalActive())
+    Serial.println("LAN HTTP start failed; will retry in 5 seconds");
+  s_web_last_probe_ms = 0;
+  s_web_probe_failures = 0;
+  Serial.printf("LAN HTTP startup: portal=%s, server=%s, heap=%u\r\n",
+                s_wm.getWebPortalActive() ? "active" : "inactive",
+                s_wm.server ? "allocated" : "null",
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  Serial.printf("LAN web: http://%s/ (General)\r\n",
+                WiFi.localIP().toString().c_str());
+  Serial.printf("LAN health check: http://%s/health\r\n",
+                WiFi.localIP().toString().c_str());
+  Serial.printf("Optional mDNS: http://%s.local/ (may not resolve on every network)\r\n",
+                config::kPortalHostname);
 }
 
 void stopLanWebPortal() {
@@ -255,9 +705,43 @@ void stopLanWebPortal() {
     return;
   }
   s_wm.stopWebPortal();
+  s_web_started_ms = 0;
+  s_web_last_probe_ms = 0;
+  s_web_probe_failures = 0;
 #ifdef WM_MDNS
   MDNS.end();
 #endif
+}
+
+// Called from the main loop only. Checking our own address distinguishes a
+// working Wi-Fi/ICMP link from a missing TCP listener; it does not block the
+// radar for more than the short socket connect timeout. The probe only tests
+// TCP accept; it deliberately does not claim to test HTTP request handling.
+void monitorLanWebPortal() {
+  if (!wifiLinkUp() || !s_wm.getWebPortalActive() ||
+      s_wm.getConfigPortalActive() || !s_web_started_ms) return;
+  const uint32_t now = millis();
+  if (static_cast<uint32_t>(now - s_web_started_ms) < kWebStartupGraceMs ||
+      (s_web_last_probe_ms &&
+       static_cast<uint32_t>(now - s_web_last_probe_ms) < kWebProbeIntervalMs) ||
+      s_adsb_fetch_active.load(std::memory_order_relaxed) ||
+      radarWorkPausedInternal()) return;
+  s_web_last_probe_ms = now;
+  WiFiClient probe;
+  const bool listening = probe.connect(WiFi.localIP(), 80, 150);
+  probe.stop();
+  if (listening) {
+    if (s_web_probe_failures) Serial.println("LAN HTTP listener recovered");
+    s_web_probe_failures = 0;
+    return;
+  }
+  Serial.printf("LAN HTTP listener probe failed (%u/2), heap=%u\r\n",
+                static_cast<unsigned>(s_web_probe_failures + 1),
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  if (++s_web_probe_failures < 2) return;
+  Serial.println("LAN HTTP listener unavailable: restarting web portal only");
+  stopLanWebPortal();
+  startLanWebPortal();
 }
 
 void prepareSta() {
@@ -301,7 +785,7 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
 
   for (uint8_t attempt = 1; attempt <= config::kWifiConnectAttempts; ++attempt) {
     if (attempt > 1) {
-      Serial.printf("WiFi connect retry %u/%u\n", attempt,
+      Serial.printf("WiFi connect retry %u/%u\r\n", attempt,
                     config::kWifiConnectAttempts);
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
@@ -371,6 +855,27 @@ bool openConfigPortal() {
 
 }  // namespace
 
+bool wifiRadarWorkPaused() { return radarWorkPausedInternal(); }
+bool wifiDisplayYieldForWeb() {
+  const uint32_t last = s_last_web_served_ms.load(std::memory_order_relaxed);
+  return last && static_cast<uint32_t>(millis() - last) < kWebDisplayYieldMs;
+}
+bool wifiTryBeginAdsbFetch() {
+  if (radarWorkPausedInternal() || !s_fetch_save_gate.tryBeginFetch(millis()))
+    return false;
+  s_adsb_fetch_active.store(true);
+  if (radarWorkPausedInternal()) {
+    s_adsb_fetch_active.store(false);
+    s_fetch_save_gate.endFetch();
+    return false;
+  }
+  return true;
+}
+void wifiEndAdsbFetch() {
+  s_adsb_fetch_active.store(false);
+  s_fetch_save_gate.endFetch();
+}
+
 bool wifiShowsSetupScreenOnBoot() {
   if (s_force_config_portal) {
     return true;
@@ -400,6 +905,7 @@ bool bootButtonConsumeTap() {
   return tap;
 }
 
+// 20-second deliberate hold, with a 10-second visible warning.
 void bootButtonPollLongPress() {
   if (wifiBootButtonPressed()) {
     portENTER_CRITICAL(&s_boot_mux);
@@ -409,11 +915,17 @@ void bootButtonPollLongPress() {
     }
     const unsigned long down_ms = s_boot_down_ms;
     portEXIT_CRITICAL(&s_boot_mux);
-
-    if (!s_long_press_handled &&
-        millis() - down_ms >= config::kBootResetHoldMs) {
+    const unsigned long elapsed = millis() - down_ms;
+    if (elapsed >= 10000UL && elapsed < config::kBootResetHoldMs) {
+      const unsigned long remaining = (config::kBootResetHoldMs - elapsed + 999UL) / 1000UL;
+      s_boot_reset_seconds = static_cast<uint8_t>(remaining);
+    } else {
+      s_boot_reset_seconds = 0;
+    }
+    if (!s_long_press_handled && elapsed >= config::kBootResetHoldMs) {
       s_long_press_handled = true;
-      Serial.println("BOOT held — resetting WiFi");
+      s_boot_reset_seconds = 0;
+      Serial.println("BOOT held for 20 seconds - resetting WiFi");
       wifiResetCredentialsAndReboot();
     }
   } else {
@@ -421,8 +933,10 @@ void bootButtonPollLongPress() {
     s_boot_is_down = false;
     portEXIT_CRITICAL(&s_boot_mux);
     s_long_press_handled = false;
+    s_boot_reset_seconds = 0;
   }
 }
+uint8_t wifiResetCountdownSeconds() { return s_boot_reset_seconds; }
 
 void wifiResetCredentialsAndReboot() {
   resetWifiCredentials();
@@ -447,6 +961,7 @@ void wifiLoop() {
       bootButtonPollLongPress();
       s_wm.process();
     }
+    monitorLanWebPortal();
   } else {
     stopLanWebPortal();
   }
@@ -469,7 +984,7 @@ bool wifiSetupConnect() {
     Serial.println("Opening WiFi setup portal (after reset)");
     if (openConfigPortal() && wifiLinkUp()) {
       WiFi.setAutoReconnect(true);
-      Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
+      Serial.printf("Connected: %s  IP %s\r\n", WiFi.SSID().c_str(),
                     WiFi.localIP().toString().c_str());
       return true;
     }
@@ -482,14 +997,14 @@ bool wifiSetupConnect() {
 
   if (wifiLinkUp()) {
     WiFi.setAutoReconnect(true);
-    Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
+    Serial.printf("Connected: %s  IP %s\r\n", WiFi.SSID().c_str(),
                   WiFi.localIP().toString().c_str());
     return true;
   }
 
   if (storedWifiCredentials() && connectSavedNetwork(true)) {
     WiFi.setAutoReconnect(true);
-    Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
+    Serial.printf("Connected: %s  IP %s\r\n", WiFi.SSID().c_str(),
                   WiFi.localIP().toString().c_str());
     return true;
   }
@@ -502,7 +1017,7 @@ bool wifiSetupConnect() {
 
   if (openConfigPortal() && wifiLinkUp()) {
     WiFi.setAutoReconnect(true);
-    Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
+    Serial.printf("Connected: %s  IP %s\r\n", WiFi.SSID().c_str(),
                   WiFi.localIP().toString().c_str());
     return true;
   }

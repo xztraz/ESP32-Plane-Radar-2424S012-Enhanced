@@ -16,8 +16,12 @@ struct Aircraft {
    *  reflects the estimated current location, not the already-stale fix. */
   uint32_t pos_age_ms;
   char callsign[9];
+  char hex[7];
+  char registration[13];
+  bool isHelicopter = false;
   char type[5];
   char alt[12];
+  bool isMilitary = false;
 };
 
 constexpr size_t kMaxAircraft = 64;

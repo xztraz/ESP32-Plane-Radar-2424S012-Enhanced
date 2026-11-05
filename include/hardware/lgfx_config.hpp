@@ -9,6 +9,7 @@
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Bus_SPI _bus;
   lgfx::Panel_GC9A01 _panel;
+  lgfx::Light_PWM _light;
 
 public:
   LGFX() {
@@ -30,6 +31,15 @@ public:
       cfg.invert = config::kDisplayInvert;
       cfg.rgb_order = config::kDisplayRgbOrder;
       _panel.config(cfg);
+    }
+    { // Backlight PWM for non-touch ESP32-2424S012
+      auto cfg = _light.config();
+      cfg.pin_bl = 3;
+      cfg.invert = false;
+      cfg.freq = 20000;
+      cfg.pwm_channel = 0;
+      _light.config(cfg);
+      _panel.setLight(&_light);
     }
     setPanel(&_panel);
   }
