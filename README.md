@@ -2,7 +2,7 @@
 
 A customized fork of [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar), built for the **ESP32-2424S012 non-touch** board (ESP32-C3 + integrated 1.28-inch GC9A01, 240 × 240 round LCD).
 
-**Fork release:** `v2.0.0`
+**Development candidate:** `v2.0.1-rc1` (the published v2.0.0 release remains the stable fallback)
 
 This is an independently customized firmware branch, **not an official release** of the upstream project. The new semantic version describes this fork; it does **not** imply that every upstream `v1.1.5` change has been merged. See [CHANGELOG.md](CHANGELOG.md) for the changes relative to upstream.
 
@@ -81,6 +81,13 @@ pio run -e supermini -t merge
 The **merged** `.bin` must be flashed to offset **`0x0000`**, not `0x1000`. The ordinary `firmware.bin` is a different artifact and must not be treated as a complete merged flash image.
 
 `UPLOAD.bat` performs a normal PlatformIO build/upload to a connected board. Keep the stable firmware backup before upgrading.
+
+## v2.0.1-rc1 LAN web server test
+
+- The radar's General, Aircraft and Status pages still use `http://<device-ip>/` (port 80).
+- Wi-Fi setup launched from the Wi-Fi page uses temporary `http://<device-ip>:81/wifi`. First-time captive AP setup remains on port 80.
+- Test `http://<device-ip>/health` from another device before trusting the LAN server. A successful internal TCP probe alone does not verify external HTTP.
+- This is an experimental recovery change; restore the v2.0.0 merged image if it misbehaves.
 
 ## Configuration
 
