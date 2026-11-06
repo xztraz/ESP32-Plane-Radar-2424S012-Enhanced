@@ -1,8 +1,16 @@
 # Changes from MatixYo's ESP32-Plane-Radar
 
-This document describes the **customized fork's changes relative to the original project**, not every internal development iteration. The fork source version is **v2.0.0**.
+This document describes the **customized fork's changes relative to the original project**, not every internal development iteration. The fork source version is **v2.0.1-rc1**.
 
 This is an independently developed fork and is **not represented as a rebase of the latest upstream tag**. Compare against the actual fork parent commit when publishing to obtain an exact Git diff.
+
+## v2.0.1-rc1 — LAN HTTP reliability test
+
+- Replaced WiFiManager's always-on LAN web portal with a standalone `WebServer` on port 80. The existing General, Aircraft, Wi-Fi and Status routes remain available.
+- WiFiManager is launched on demand for Wi-Fi scans/credentials on port 81; first-boot captive AP setup continues using port 80.
+- Reworked the LAN listener recovery to restart only the independent HTTP listener after three failed probes, rather than restarting the WiFiManager portal.
+- This is an **untested candidate**, not a verified field fix. A local TCP probe cannot establish that remote HTTP works. Validate `/health` remotely before promoting to a release.
+- BearSSL/ADS-B data processing and radar rendering are unchanged.
 
 ## Hardware and build
 
