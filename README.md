@@ -22,13 +22,16 @@ This is an independently customized firmware branch, **not an official release**
 
 Configure the radar from a browser using the General and Aircraft pages.
 
-<img src="docs/images/controlexample1.JPG" alt="Radar web control interface — screenshot 1" width="720">
-
-<img src="docs/images/controlexample2a.JPG" alt="Radar web control interface — screenshot 2, part A" width="720">
-
-<img src="docs/images/controlexample2b.JPG" alt="Radar web control interface — screenshot 2, part B" width="720">
-
-<img src="docs/images/controlexample2c.JPG" alt="Radar web control interface — screenshot 2, part C" width="720">
+<table>
+  <tr>
+    <td valign="top"><img src="docs/images/controlexample1.JPG" alt="Radar web control interface — screenshot 1"></td>
+    <td valign="top"><img src="docs/images/controlexample2a.JPG" alt="Radar web control interface — screenshot 2, part A"></td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/controlexample2b.JPG" alt="Radar web control interface — screenshot 2, part B"></td>
+    <td valign="top"><img src="docs/images/controlexample2c.JPG" alt="Radar web control interface — screenshot 2, part C"></td>
+  </tr>
+</table>
 
 ## Features
 
