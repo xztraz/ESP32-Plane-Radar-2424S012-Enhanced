@@ -18,6 +18,18 @@ This is an independently customized firmware branch, **not an official release**
 
 ![Six radar background pattern previews](docs/images/radar-patterns.png)
 
+### Web control interface
+
+Configure the radar from a browser using the General and Aircraft pages.
+
+<img src="docs/images/controlexample1.JPG" alt="Radar web control interface — screenshot 1" width="720">
+
+<img src="docs/images/controlexample2a.JPG" alt="Radar web control interface — screenshot 2, part A" width="720">
+
+<img src="docs/images/controlexample2b.JPG" alt="Radar web control interface — screenshot 2, part B" width="720">
+
+<img src="docs/images/controlexample2c.JPG" alt="Radar web control interface — screenshot 2, part C" width="720">
+
 ## Features
 
 - Live aircraft positions from [adsb.fi](https://adsb.fi/) approximately every 5 seconds, via BearSSL HTTPS.
