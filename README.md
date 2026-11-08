@@ -2,8 +2,6 @@
 
 A customized fork of [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar), built for the **ESP32-2424S012 non-touch** board (ESP32-C3 + integrated 1.28-inch GC9A01, 240 × 240 round LCD).
 
-**Stable source version:** `v2.0.1` (based on overnight-tested rc4.1 firmware; new status counters are pending on-device verification). The existing **v2.0.0** release remains available for rollback.
-
 This is an independently customized firmware branch, **not an official release** of the upstream project. The new semantic version describes this fork; it does **not** imply that every upstream `v1.1.5` change has been merged. See [CHANGELOG.md](CHANGELOG.md) for the changes relative to upstream.
 
 ## Pictures
