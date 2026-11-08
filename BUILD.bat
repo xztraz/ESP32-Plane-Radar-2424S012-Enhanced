@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
  echo.
  echo ===========================================================
- echo  PLANE RADAR v2.0.0 - ESP32-2424S012 NON-TOUCH
+ echo  PLANE RADAR v2.0.1 - ESP32-2424S012 NON-TOUCH
  echo  PlatformIO Core Python - no Git or separate Python needed
  echo ===========================================================
  echo.
@@ -59,7 +59,7 @@ if not exist "%~dp0.pio\build\supermini\firmware-merged.bin" (
 
 echo.
 echo ===========================================================
-echo  v2.0.0 CLEAN BUILD SUCCESSFUL
+echo  v2.0.1 CLEAN BUILD SUCCESSFUL
 echo ===========================================================
 echo.
 echo Normal PlatformIO firmware:
@@ -98,7 +98,7 @@ exit /b 0
 
 :buildFailed
 echo.
-echo ERROR: v2.0.0 build or merge failed. DO NOT flash incomplete output.
+echo ERROR: v2.0.1 build or merge failed. DO NOT flash incomplete output.
 echo Copy the error text from this window.
 echo.
 pause

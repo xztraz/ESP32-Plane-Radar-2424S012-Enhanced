@@ -26,6 +26,9 @@ const char kAircraft[] PROGMEM = R"rdr(<!doctype html><html lang="en"><head><met
 <canvas id="fade_curve_preview" width="320" height="110" aria-label="Preview of selected trail fading curve"></canvas>
 <p class="meta">The curve controls how quickly trail colors move down the selected palette toward black. Crossings brighten by saturating additive blending.</p>
 <label class="check"><input type="checkbox" id="dots">Show trail dots</label>
+<label>Dot spacing: <strong id="dot_spacing_label">Every 3rd recorded fix</strong><input type="range" id="dot_spacing" min="1" max="8" step="1" value="3"></label>
+<label>Dot diameter: <strong id="dot_size_label">4.5 px</strong><input type="range" id="dot_size" min="4" max="14" step="1" value="9"></label>
+<p class="meta">Dots use existing range-adaptive trail samples; the gap shows aircraft speed. Additive, anti-aliased dots stay fixed at real recorded positions.</p>
 <label>Aircraft icon size: <strong id="size_label">100%</strong><input type="range" id="size" min="10" max="200" step="10" value="100"></label>
 <p class="meta">Refresh adapts to range: 6.25 FPS at 5–10 km, down to 2 FPS at 100 km. Aircraft fetching remains every 5 seconds.</p></section>
 <section><h2>Watched aircraft (maximum 50)</h2>
@@ -59,6 +62,13 @@ const char kStatus[] PROGMEM = R"rdr(<!doctype html><html lang="en"><head><meta 
 <tr><th>Aircraft projection</th><td id="projectionUs">-</td></tr><tr><th>Trails</th><td id="trailsUs">-</td></tr><tr><th>Edge dots</th><td id="dotsUs">-</td></tr>
 <tr><th>Aircraft labels</th><td id="labelsUs">-</td></tr><tr><th>Aircraft icons</th><td id="iconsUs">-</td></tr>
 <tr><th>SPI screen transfer</th><td id="transferUs">-</td></tr><tr><th>Last web response</th><td id="web">-</td></tr>
+<tr><th colspan="2">Web server reliability (since boot)</th></tr>
+<tr><th>Uptime</th><td id="uptime">-</td></tr>
+<tr><th>HTTP health checks passed</th><td id="webHealthOk">-</td></tr>
+<tr><th>HTTP health checks failed</th><td id="webHealthFailed">-</td></tr>
+<tr><th>Automatic web server rebuilds</th><td id="webRebuilds">-</td></tr>
+<tr><th>Verified recoveries after rebuild</th><td id="webVerifiedRecoveries">-</td></tr>
+<tr><th>Last verified recovery</th><td id="webLastRecovery">-</td></tr>
 </tbody></table></section><p id="msg" role="status" class="meta"></p><script src="/assets/status.js" defer></script>
 </body></html>)rdr";
 const char kCss[] PROGMEM = R"rdr(:root{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;color-scheme:dark;background:#111b21;color:#e6f1f5}
@@ -282,6 +292,10 @@ $('add').onclick=()=>{const e={kind:$('kind').value,id:$('id').value.trim().toUp
  $('id').value='';$('name').value='';ruleMsg.textContent='Rule added. Press Save aircraft settings to persist.';paintRules();};
 $('size').addEventListener('input',()=>{$('size_label').textContent=$('size').value+'%';});
 $('trail').addEventListener('input',()=>{$('trail_step').textContent=$('trail').value;});
+function updateDotLabels(){const n=Number($('dot_spacing').value);$('dot_spacing_label').textContent='Every '+n+(n===1?'st':n===2?'nd':n===3?'rd':'th')+' recorded fix';
+ $('dot_size_label').textContent=(Number($('dot_size').value)/2).toFixed(1)+' px';}
+$('dot_spacing').addEventListener('input',updateDotLabels);
+$('dot_size').addEventListener('input',updateDotLabels);
 $('trail_dark').addEventListener('input',()=>{
  $('trail_dark_label').textContent=$('trail_dark').value+'%';
  if(overlay.style.display==='flex')drawTrailPreview();
@@ -309,6 +323,10 @@ async function load(){try{const r=await fetch('/api/aircraft',{cache:'no-store'}
  $('label_brightness').value=String(Number.isInteger(labelBrightness)&&labelBrightness>=20&&labelBrightness<=100?labelBrightness:100);
  $('label_brightness_value').textContent=$('label_brightness').value+'%';
  $('dots').checked=opts[1]==='1';
+ const savedSpacing=Number(parts[6]||'3'),savedSize=Number(parts[7]||'9');
+ $('dot_spacing').value=String(Number.isInteger(savedSpacing)&&savedSpacing>=1&&savedSpacing<=8?savedSpacing:3);
+ $('dot_size').value=String(Number.isInteger(savedSize)&&savedSize>=4&&savedSize<=14?savedSize:9);
+ updateDotLabels();
  [['callsign',1],['registration',2],['type',4],['altitude',8]].forEach(([id,mask])=>$(id).checked=(Number(opts[0])&mask)!==0);
  paintBase();paintRules();$('save').disabled=false;msg.textContent='';
  }catch(e){msg.textContent='Could not load aircraft settings: '+e.message;}}
@@ -320,9 +338,11 @@ $('save').onclick=async()=>{const mask=[['callsign',1],['registration',2],['type
  if(!Number.isInteger(trailDark)||trailDark<0||trailDark>100){msg.textContent='Trail start darkening must be 0 to 100%.';return;}
  const trailCurve=Number($('trail_curve').value);
  if(!Number.isInteger(trailCurve)||trailCurve<0||trailCurve>3){msg.textContent='Invalid trail fade curve.';return;}
+ const dotSpacing=Number($('dot_spacing').value),dotSize=Number($('dot_size').value);
+ if(!Number.isInteger(dotSpacing)||dotSpacing<1||dotSpacing>8||!Number.isInteger(dotSize)||dotSize<4||dotSize>14){msg.textContent='Invalid dot spacing or size.';return;}
  const trail=trailStep*4,watches=encodeWatches();if(watches.length>3700){msg.textContent='Watchlist is too long.';return;}
  opts=[String(mask),$('dots').checked?'1':'0',$('size').value,$('label_brightness').value];
- const data=new URLSearchParams({colors:base.join(','),options:opts.join(','),trail:String(trail),trailDark:String(trailDark),trailCurve:String(trailCurve),watchlist:watches});
+ const data=new URLSearchParams({colors:base.join(','),options:opts.join(','),trail:String(trail),trailDark:String(trailDark),trailCurve:String(trailCurve),dotSpacing:String(dotSpacing),dotSize:String(dotSize),watchlist:watches});
  $('save').disabled=true;msg.textContent='Saving...';try{
  const response=await postSettingsWhenReady('/api/aircraft',data.toString());
  if(!response.ok)throw Error(await response.text());msg.textContent='Aircraft settings saved.';
@@ -331,9 +351,20 @@ load();
 )rdr";
 const char kStatusJs[] PROGMEM = R"rdr(
 'use strict';
+function elapsedTime(seconds){
+ const total=Math.max(0,Math.floor(seconds));
+ const days=Math.floor(total/86400), hours=Math.floor(total%86400/3600),
+       minutes=Math.floor(total%3600/60), secs=total%60;
+ return (days?days+'d ':'')+String(hours).padStart(2,'0')+':'+
+        String(minutes).padStart(2,'0')+':'+String(secs).padStart(2,'0');
+}
 async function tick(){
  try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const v=await r.json();
  const fields={version:v.version,
+ uptime:elapsedTime(v.uptimeSec),webHealthOk:v.webHealthOk,
+ webHealthFailed:v.webHealthFailed,webRebuilds:v.webRebuilds,
+ webVerifiedRecoveries:v.webVerifiedRecoveries,
+ webLastRecovery:v.webLastRecoveryAgeSec===null?'Never':elapsedTime(v.webLastRecoveryAgeSec)+' ago',
  cpuNow:v.cpuMhz+' MHz',cpuFrame:v.frameCpuStart+' / '+v.frameCpuEnd+' MHz (start/end)',
  slowSpi:v.slowSpiCount+' total'+(v.slowSpiCount ? ' · last '+(v.slowSpiUs/1000).toFixed(1)+' ms at '+v.slowSpiCpuStart+'/'+v.slowSpiCpuEnd+' MHz' : ''),
  rssi:v.rssi+' dBm',heap:v.heap+' bytes',minheap:v.minheap+' bytes',count:v.count,

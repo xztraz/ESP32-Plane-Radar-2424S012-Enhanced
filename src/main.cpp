@@ -73,8 +73,13 @@ void adsbFetchTask(void*) {
                                                      services::location::lon(),
                                                      ui::radar::fetchRadiusKm());
         static uint32_t last_memory_log_ms = 0;
+        static bool previous_fetch_failed = false;
         const uint32_t now = millis();
-        if (!ok || static_cast<uint32_t>(now - last_memory_log_ms) >= 300000u) {
+        // A persistent invalid payload must not flood serial/memory probes
+        // every five seconds. Log first failure, then the 5-minute summary.
+        const bool first_failure = !ok && !previous_fetch_failed;
+        if (first_failure ||
+            static_cast<uint32_t>(now - last_memory_log_ms) >= 300000u) {
           const size_t heap_after = ESP.getFreeHeap();
           const size_t block_after = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
           Serial.printf("adsb memory (%s): free %u -> %u, largest %u -> %u, min %u bytes\r\n",
@@ -86,6 +91,7 @@ void adsbFetchTask(void*) {
                         static_cast<unsigned>(ESP.getMinFreeHeap()));
           last_memory_log_ms = now;
         }
+        previous_fetch_failed = !ok;
         wifiEndAdsbFetch();
         vTaskDelay(pdMS_TO_TICKS(config::kAdsbFetchIntervalMs));
       } else {
