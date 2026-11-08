@@ -28,6 +28,7 @@
 #include "ui/trail_color_gradient.h"
 #include "ui/trail_beam_profile.h"
 #include "ui/trail_compositing.h"
+#include "ui/trail_dots.h"
 #include "ui/radar_theme.h"
 #include "ui/runway_overlay.h"
 #include "ui/turn_prediction.h"
@@ -176,6 +177,10 @@ bool s_frame_attempted = false;
 // No separate fast/slow layers, icon erasing or secondary graphic buffers.
 bool s_scene_dirty = true;
 bool s_last_scene_dynamic = false;
+// Tracks actual skipped empty frames; no extra redraws or network requests.
+bool s_empty_idle_skipped = false;
+uint32_t s_empty_idle_started_ms = 0;
+constexpr uint32_t kEmptyIdleWakeReportMinMs = 60u * 1000u;
 bool s_last_countdown_active = false;
 uint32_t s_last_frame_us = 0;  // Full draw + SPI transfer.
 uint32_t s_last_scene_us = 0;  // Drawing only, excluding SPI transfer.
@@ -1149,8 +1154,12 @@ struct TrailHistory {
   uint16_t last_color;
   uint8_t last_hue;
   uint8_t last_shade;
+  uint8_t dot_phase;        // newest stored fix's marker phase, modulo dot_stride
+  uint8_t dot_stride;       // tracked without storing per-fix marker flags
   TrailFix fixes[kTrailMaxSamples];
 };
+static_assert(sizeof(TrailHistory) == 228,
+              "Trail marker phase must use existing alignment padding");
 // Cache one fractional palette position per fix at its real timestamp.
 // Color lookup now happens AFTER spatial interpolation in the rasterizer.
 TrailShadeLut buildTimedTrailShades(const TrailHistory& history, size_t visible,
@@ -1260,6 +1269,8 @@ void rememberTrailFixes(const services::adsb::Aircraft* planes, size_t count,
     if (t->count && static_cast<uint32_t>(now - t->last_seen_ms) > 120000u) {
       t->count = 0;
       t->next = 0;
+      t->dot_phase = 0;
+      t->dot_stride = 0;
     }
     t->last_seen_ms = now;
     if (t->last_fetch_ms == fetch_ms) continue;
@@ -1275,6 +1286,15 @@ void rememberTrailFixes(const services::adsb::Aircraft* planes, size_t count,
     if (t->count) {
       const TrailFix& prior = t->fixes[(t->next + kTrailMaxSamples - 1) % kTrailMaxSamples];
       if (prior.east_10m == e && prior.north_10m == n) continue;
+    }
+    const uint8_t stride = ui::trails::dotSpacing();
+    if (t->count == 0 || t->dot_stride != stride) {
+      // First recorded fix gets a marker. Changing the slider rephases once.
+      // No old fix is moved and existing positions remain untouched.
+      t->dot_phase = 0;
+      t->dot_stride = stride;
+    } else {
+      t->dot_phase = ui::trail_dots::nextPhase(t->dot_phase, stride);
     }
     t->last_sample_ms = now;
     t->fixes[t->next] = {e, n, static_cast<uint16_t>(now >> 10)};
@@ -1359,7 +1379,6 @@ void drawTrailStrokeFloatFallback(float ax, float ay, float bx, float by,
   if (length_sq < 0.0001f) return;
   const float inv_length_sq = 1.0f / length_sq; // one division per segment
   const bool rounded_caps = true;  // Joins are always continuous.
-  const bool show_dots = ui::display_options::trailDots();
   constexpr float kHalfWidth = 1.6f;
   constexpr float kCoreHalfWidth = 0.6f;
   constexpr float kBoundingPad = 2.70f;
@@ -1384,7 +1403,7 @@ void drawTrailStrokeFloatFallback(float ax, float ay, float bx, float by,
       float center_t = 0.0f;
       const float d_sq = trailDistanceSq(x + 0.5f, y + 0.5f, ax, ay,
                                          vx, vy, inv_length_sq, &center_t,rounded_caps);
-      const float reject_r = (show_dots ? 1.95f : kHalfWidth) + 0.7072f;
+      const float reject_r = kHalfWidth + 0.7072f;
       if (d_sq >= reject_r * reject_r) continue;
       // 4x4 coverage for the 1.2px core and 3.2px shoulders.
       unsigned core_samples = 0, outer_samples = 0;
@@ -1394,11 +1413,8 @@ void drawTrailStrokeFloatFallback(float ax, float ay, float bx, float by,
           const float syp = y + (sy + 0.5f) * 0.25f;
           const float sample_sq = trailDistanceSq(sxp, syp, ax, ay,
               vx, vy, inv_length_sq, nullptr, rounded_caps);
-          // Optional visible dots enlarge only the rounded sample caps,
-          // never switch joins off when the checkbox is unchecked.
-          const float along = ((sxp - ax) * vx + (syp - ay) * vy) * inv_length_sq;
-          const bool dot_cap = show_dots && (along <= 0.0f || along >= 1.0f);
-          if (sample_sq <= (dot_cap ? 1.95f * 1.95f : coverage_radius_sq)) {
+          // Recorded marker dots are a separate additive AA pass.
+          if (sample_sq <= coverage_radius_sq) {
             ++outer_samples;
             if (sample_sq <= core_radius_sq) ++core_samples;
           }
@@ -1479,7 +1495,7 @@ inline bool trailSampleCovered(const TrailSegmentQ4& segment,
 inline uint8_t trailBeamZone(const TrailSegmentQ4& segment,
                              int32_t px, int32_t py,
                              int32_t outer_cross, int32_t core_cross,
-                             bool rounded_caps, bool show_dots) {
+                             bool rounded_caps) {
   const int32_t wx = px - segment.ax;
   const int32_t wy = py - segment.ay;
   const int32_t dot = wx * segment.dx + wy * segment.dy;
@@ -1488,14 +1504,14 @@ inline uint8_t trailBeamZone(const TrailSegmentQ4& segment,
   if (dot <= 0) {
     dist_sq = wx * wx + wy * wy;
     if (dist_sq <= ui::trail_beam::kCoreRadiusSqQ8) return 2;
-    return dist_sq <= (show_dots ? 973 : ui::trail_beam::kOuterRadiusSqQ8) ? 1 : 0;
+    return dist_sq <= ui::trail_beam::kOuterRadiusSqQ8 ? 1 : 0;
   }
   if (dot >= segment.len_sq) {
     const int32_t ex = wx - segment.dx;
     const int32_t ey = wy - segment.dy;
     dist_sq = ex * ex + ey * ey;
     if (dist_sq <= ui::trail_beam::kCoreRadiusSqQ8) return 2;
-    return dist_sq <= (show_dots ? 973 : ui::trail_beam::kOuterRadiusSqQ8) ? 1 : 0;
+    return dist_sq <= ui::trail_beam::kOuterRadiusSqQ8 ? 1 : 0;
   }
   const int32_t cross = wx * segment.dy - wy * segment.dx;
   const int32_t magnitude = std::abs(cross);
@@ -1540,8 +1556,7 @@ void drawTrailStrokeImpl(float ax, float ay, float bx, float by,
   if (line.len_sq == 0) return;
 
   const bool rounded_caps = true;  // No gaps when trail dots are unchecked.
-  const bool show_dots = ui::display_options::trailDots();
-  // Cover the 1.6px radius (or 1.95px optional dots) plus AA margins.
+  // The continuous line is independent of distinct recorded-position dots.
   constexpr int32_t kPadQ4 = 44;
   const int left = std::max<int32_t>(0,
       trailFloorQ4(std::min(qax, qbx) - kPadQ4));
@@ -1555,9 +1570,8 @@ void drawTrailStrokeImpl(float ax, float ay, float bx, float by,
   // Early-reject radius = (1.6px + half pixel diagonal)^2, in Q8.
   // Inner and outer stroke coverage use the same 16 samples.
   constexpr int32_t outer_sq = 1363;
-  constexpr int32_t dot_outer_sq = 1808; // (1.95 + 0.707)^2 in Q8.
   const int32_t outer_cross = trailIsqrt64(
-      static_cast<uint64_t>(show_dots ? dot_outer_sq : outer_sq) * line.len_sq);
+      static_cast<uint64_t>(outer_sq) * line.len_sq);
   const int32_t cover_cross = trailIsqrt64(
       static_cast<uint64_t>(ui::trail_beam::kOuterRadiusSqQ8) * line.len_sq);
   const int32_t core_cross = trailIsqrt64(
@@ -1584,7 +1598,7 @@ void drawTrailStrokeImpl(float ax, float ay, float bx, float by,
       if (rx * rx + ry * ry > ring_sq) continue;
       int32_t center_t = 0;
       if (!trailSampleCovered(line, px + 8, py + 8,
-                              show_dots ? dot_outer_sq : outer_sq,
+                              outer_sq,
                               outer_cross, rounded_caps, &center_t)) continue;
       // One 4x4 subpixel pass: 100% core (1.2px), 50% shoulders
       // (to 3.2px total). Antialias both borders naturally.
@@ -1594,7 +1608,7 @@ void drawTrailStrokeImpl(float ax, float ay, float bx, float by,
         for (int sx = 0; sx < 4; ++sx) {
           const uint8_t zone = trailBeamZone(line,
               px + kRasterSample[sx], qy,
-              cover_cross, core_cross, rounded_caps, show_dots);
+              cover_cross, core_cross, rounded_caps);
           if (zone) {
             ++outer_samples;
             core_samples += (zone == 2);
@@ -1645,6 +1659,91 @@ void drawTrailStrokeGradient(float ax, float ay, float bx, float by,
   }
   drawTrailStrokeImpl<true>(ax, ay, bx, by, alpha_a, alpha_b,
                             shade_start_q8, shade_end_q8, hue);
+}
+
+// Integer-only Q4 circular AA at real recorded fixes. The 4x4 samples
+// resolve fractional dot placement and diameter, with a brighter center.
+// Every pixel is saturating-ADDED to the existing RGB332 scene. This pass
+// does not allocate an image, a dot list or any additional trail history.
+void drawRecordedDotQ4(int32_t center_x, int32_t center_y,
+                       uint16_t color, uint8_t diameter_half_px) {
+  const int32_t radius_q4 = static_cast<int32_t>(diameter_half_px) * 4;
+  const int32_t core_q4 = std::max<int32_t>(1, radius_q4 - 12); // 0.75 px shoulder
+  const int32_t outer_sq = radius_q4 * radius_q4;
+  const int32_t core_sq = core_q4 * core_q4;
+  const int32_t ring_r = (radar::kTrailDisplayRadiusPx - 1) * kRasterOne;
+  const int32_t ring_sq = ring_r * ring_r;
+  const int left = std::max<int32_t>(0, trailFloorQ4(center_x - radius_q4 - kRasterOne));
+  const int right = std::min<int32_t>(radar::kSize - 1,
+                             trailFloorQ4(center_x + radius_q4 + kRasterOne));
+  const int top = std::max<int32_t>(0, trailFloorQ4(center_y - radius_q4 - kRasterOne));
+  const int bottom = std::min<int32_t>(radar::kSize - 1,
+                              trailFloorQ4(center_y + radius_q4 + kRasterOne));
+  if (left > right || top > bottom) return;
+  for (int y = top; y <= bottom; ++y) {
+    const int32_t py = y << kRasterShift;
+    for (int x = left; x <= right; ++x) {
+      const int32_t px = x << kRasterShift;
+      unsigned core_samples = 0, outer_samples = 0;
+      for (int sy = 0; sy < 4; ++sy) {
+        const int32_t iy = py + kRasterSample[sy];
+        const int32_t dy = iy - center_y;
+        const int32_t ry = iy - (radar::kCenterY << kRasterShift);
+        for (int sx = 0; sx < 4; ++sx) {
+          const int32_t ix = px + kRasterSample[sx];
+          const int32_t rx = ix - (radar::kCenterX << kRasterShift);
+          if (rx * rx + ry * ry > ring_sq) continue;
+          const int32_t dx = ix - center_x;
+          const int32_t distance_sq = dx * dx + dy * dy;
+          if (distance_sq > outer_sq) continue;
+          ++outer_samples;
+          core_samples += (distance_sq <= core_sq);
+        }
+      }
+      if (!outer_samples) continue;
+      const uint16_t intensity = ui::trail_dots::coverageQ12(
+          core_samples, outer_samples);
+      if (intensity < 61) continue;
+      s_draw->drawPixel(x, y, addRgb565CoverageQ12(
+          s_draw->readPixel(x, y), color, intensity));
+    }
+  }
+}
+
+// Each marker remains tied to its original stored fix. Its phase is derived
+// from the newest fix's two-byte-in-padding counter, so rotating the 32-point
+// buffer never makes dots hop to different samples. The existing palette LUT
+// provides the same age/orphan fade as the continuous trace.
+void drawRecordedTrailDots(const TrailHistory& history,
+                           const TrailShadeLut& shades, size_t visible,
+                           uint8_t palette_hue) {
+  if (!ui::display_options::trailDots() || !visible) return;
+  const uint8_t spacing = ui::trails::dotSpacing();
+  const uint8_t phase = history.dot_stride == spacing ? history.dot_phase : 0;
+  const uint8_t diameter = ui::trails::dotDiameterHalfPx();
+  // The ring-3 values are integer presets: no float conversion or arithmetic.
+  constexpr uint16_t kRing3Km[] = {5, 10, 15, 25, 50, 75, 100};
+  const uint8_t range_index = radar::rangeIndex();
+  if (range_index >= sizeof(kRing3Km) / sizeof(kRing3Km[0])) return;
+  const uint16_t range_km = kRing3Km[range_index];
+  const size_t first = static_cast<size_t>(history.count) - visible;
+  for (size_t i = 0; i < visible; ++i) {
+    const uint8_t age = static_cast<uint8_t>(visible - 1 - i);
+    if (!ui::trail_dots::hasDot(phase, spacing, age)) continue;
+    const size_t index = (history.next + kTrailMaxSamples - history.count +
+                          first + i) % kTrailMaxSamples;
+    const TrailFix& fix = history.fixes[index];
+    const int32_t cx_q4 = (radar::kCenterX << kRasterShift) +
+        ui::trail_dots::offsetQ4(fix.east_10m, range_km,
+                                 radar::kGridOuterRadius);
+    const int32_t cy_q4 = (radar::kCenterY << kRasterShift) -
+        ui::trail_dots::offsetQ4(fix.north_10m, range_km,
+                                 radar::kGridOuterRadius);
+    const uint16_t shade = shades.at(age);
+    const uint16_t color = trailColorAtFractionQ12(
+        palette_hue, shade, shade, 0);
+    if (color) drawRecordedDotQ4(cx_q4, cy_q4, color, diameter);
+  }
 }
 
 // Complete one aircraft's MAX-composited emission, then add it to the
@@ -1817,6 +1916,7 @@ void drawAircraftTrail(const services::adsb::Aircraft& plane,
       }
     }
   }
+  drawRecordedTrailDots(*t, trail_shades, visible, selection.hue);
 }
 
 
@@ -1877,6 +1977,7 @@ void drawOrphanTrails(const services::adsb::Aircraft* active, size_t n,
       prev_x=x; prev_y=y; prev_alpha=a;
       have_previous=true;
     }
+    drawRecordedTrailDots(history, orphan_shades, visible, history.last_hue);
     flushTrailGroup();
   }
 }
@@ -2264,7 +2365,8 @@ void drawWifiResetCountdown() {
 void renderFrame(bool force) {
   const uint32_t started = micros();
   const uint32_t now = millis();
-  const bool scene_dynamic = services::adsb::aircraftCount() != 0 ||
+  const size_t aircraft_count = services::adsb::aircraftCount();
+  const bool scene_dynamic = aircraft_count != 0 ||
                              hasUnexpiredTrail(now) || hasFadingGhost(now);
   const bool countdown_active = wifiResetCountdownSeconds() != 0;
   const bool countdown_changed = countdown_active != s_last_countdown_active;
@@ -2274,8 +2376,25 @@ void renderFrame(bool force) {
   // frame, then leave the unchanged radar idle until something changes.
   if (!force && !s_scene_dirty && !scene_dynamic &&
       !s_last_scene_dynamic && !countdown_active && !countdown_changed) {
+    if (!s_empty_idle_skipped) {
+      s_empty_idle_skipped = true;
+      s_empty_idle_started_ms = now;
+    }
     s_last_frame_us = 0;
     return;
+  }
+
+  // Report once if a real aircraft wakes rendering after a prolonged empty
+  // idle. A forced redraw (range/theme change) with zero aircraft is normal.
+  if (s_empty_idle_skipped) {
+    const uint32_t idle_ms = now - s_empty_idle_started_ms;
+    if (aircraft_count != 0 && idle_ms >= kEmptyIdleWakeReportMinMs) {
+      Serial.printf("radar: drawing resumed after empty idle %lumin, "
+                    "aircraft=%u\r\n",
+                    static_cast<unsigned long>(idle_ms / 60000u),
+                    static_cast<unsigned>(aircraft_count));
+    }
+    s_empty_idle_skipped = false;
   }
 
   s_stage_timing = {};

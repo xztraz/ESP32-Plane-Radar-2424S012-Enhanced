@@ -7,9 +7,12 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <memory>
+#include <new>
 
 #include <Preferences.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <esp32-hal-cpu.h>
 
@@ -31,6 +34,7 @@
 #include "services/adsb_client.h"
 #include "services/radar_web_pages.h"
 #include "services/fetch_save_gate.h"
+#include "services/web_health_reply.h"
 #include <WebServer.h>
 
 portMUX_TYPE s_boot_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -77,15 +81,39 @@ constexpr char kPrefsForcePortalKey[] = "portal";
 bool s_force_config_portal = false;
 WiFiManager s_wm;
 bool s_wm_configured = false;
-// An active WiFiManager portal flag does not prove that TCP port 80 is
-// listening. Check the local listener infrequently and recover if it fails
-// twice in a row. No extra FreeRTOS task or persistent socket is required.
-constexpr uint32_t kWebProbeIntervalMs = 15000u;
-constexpr uint32_t kWebStartupGraceMs = 8000u;
+// Port 80 belongs to an independent WebServer, not WiFiManager.
+// Check a *complete* /health HTTP response, cooperatively: the request is
+// sent in one main-loop iteration, WebServer::handleClient() serves it in
+// later iterations, and polling only consumes bytes that are already ready.
+// A synchronous GET from this loop would deadlock/stall the server.
+constexpr uint32_t kWebProbeIntervalMs = 45000u;
+constexpr uint32_t kWebStartupGraceMs = 15000u;
+constexpr uint32_t kWebProbeResponseTimeoutMs = 4000u;
+constexpr uint32_t kWebRestartCooldownMs = 120000u;
+constexpr uint8_t kWebProbeFailuresBeforeRestart = 3;
+constexpr uint16_t kWifiAdminPort = 81;
+std::unique_ptr<WebServer> s_lan_server;
+WebServer* s_current_http_server = nullptr;
+bool s_wifi_admin_requested = false;
+bool s_wifi_admin_close_requested = false;
 uint32_t s_web_started_ms = 0;
 uint32_t s_web_last_probe_ms = 0;
 uint8_t s_web_probe_failures = 0;
 uint32_t s_web_last_start_attempt_ms = 0;
+uint32_t s_web_last_rebuild_ms = 0;
+uint32_t s_web_health_ok_total = 0;
+uint32_t s_web_health_fail_total = 0;
+uint32_t s_web_health_rebuild_total = 0;
+uint32_t s_web_health_verified_recovery_total = 0;
+uint32_t s_web_last_verified_recovery_ms = 0;
+bool s_web_verify_after_rebuild = false;
+uint32_t s_web_health_handler_hits = 0;
+uint32_t s_web_probe_handler_hits_at_start = 0;
+uint32_t s_web_probe_started_ms = 0;
+enum class WebProbeState : uint8_t { kIdle, kAwaitingResponse };
+WebProbeState s_web_probe_state = WebProbeState::kIdle;
+WiFiClient s_web_probe_client;
+services::web_health::Reply s_web_probe_reply;
 
 // Bounded, non-blocking Wi-Fi work window. The main loop continues
 // serving HTTP and the BOOT button; only radar painting and new ADS-B HTTPS
@@ -107,6 +135,8 @@ bool radarWorkPausedInternal() {
 }
 
 void beginWifiWork() {
+  s_wifi_admin_requested = true;
+  s_wifi_admin_close_requested = false;
   const uint32_t now = millis();
   if (!radarWorkPausedInternal()) {
     s_wifi_pause_started_ms.store(now);
@@ -124,6 +154,7 @@ void keepWifiWorkAlive() {
 void finishWifiWork() {
   if (radarWorkPausedInternal()) Serial.println("Wi-Fi setup: radar resumes");
   s_wifi_pause_until_ms.store(0);
+  if (s_wifi_admin_requested) s_wifi_admin_close_requested = true;
 }
 
 void ensureWifiManager();
@@ -139,8 +170,8 @@ bool wifiLinkUp();
 // setCustomBodyHeader(). Add a tiny navigation bar to its Wi-Fi pages after
 // DOMContentLoaded; radar pages have their own navigation in flash-resident
 // HTML. Do not allocate a large dynamic string for this menu.
-constexpr char kWifiNavigationHead[] = R"radarnav(<link rel="stylesheet" href="/assets/radar.css">
-<script>
+constexpr char kWifiNavigationHead[] = R"radarnav(<script>
+(function(){var c=document.createElement('link');c.rel='stylesheet';c.href='http://'+location.hostname+'/assets/radar.css';document.head.appendChild(c);})();
 document.addEventListener('DOMContentLoaded', function () {
   document.body.classList.add('plane-radar-wifi');
   if (document.getElementById('plane-radar-links')) return;
@@ -150,7 +181,7 @@ document.addEventListener('DOMContentLoaded', function () {
   [['General','/general'],['Aircraft','/aircraft'],['Wi-Fi','/wifi-settings'],['Status','/status']]
     .forEach(function (item) {
       var link = document.createElement('a');
-      link.href = item[1];
+      link.href = 'http://' + location.hostname + item[1];
       link.textContent = item[0];
       if (item[0] === 'Wi-Fi') link.className = 'active';
       menu.appendChild(link);
@@ -160,7 +191,7 @@ document.addEventListener('DOMContentLoaded', function () {
   if (location.pathname === '/wifi' || location.pathname === '/wifinoscan') {
     setInterval(function () {
       if (document.visibilityState === 'visible')
-        fetch('/api/wifi/ping', {cache:'no-store'}).catch(function () {});
+        fetch('http://' + location.hostname + '/api/wifi/ping', {mode:'no-cors', cache:'no-store'}).catch(function () {});
     }, 10000);
   }
 });
@@ -188,14 +219,16 @@ const char kWifiPrepareHtml[] PROGMEM = R"rdr(<!doctype html>
 <section><h2>Wi-Fi configuration</h2><p id="message">Pausing radar and finishing the current aircraft download before scanning for networks...</p>
 <p><a href="/general">Cancel and resume radar</a></p>
 <div id="fallback" hidden><p>Aircraft download did not finish promptly. To avoid locking up the radar, a network scan was not started.</p>
-<p><a href="/wifinoscan">Enter network manually (without a scan)</a></p>
+<p><a href="#" id="manual-fallback">Enter network manually (without a scan)</a></p>
 <p><a href="/wifi-prepare">Retry network scan</a></p></div></section>
 <script>
 (function () {
   var began = Date.now();
+  var wifiAdminBase = 'http://' + location.hostname + ':81';
+  document.getElementById('manual-fallback').href = wifiAdminBase + '/wifinoscan';
   function check() {
     fetch('/api/wifi/ready', {cache:'no-store'}).then(function (r) {return r.json();}).then(function (s) {
-      if (s.ready) {location.replace(location.search.indexOf('manual=1') >= 0 ? '/wifinoscan' : '/wifi'); return;}
+      if (s.ready) {location.replace(wifiAdminBase + (location.search.indexOf('manual=1') >= 0 ? '/wifinoscan' : '/wifi')); return;}
       if (Date.now()-began > 15000) {document.getElementById('message').textContent='The radar is still busy.';document.getElementById('fallback').hidden=false;return;}
       setTimeout(check,500);
     }).catch(function () {
@@ -223,15 +256,15 @@ void sendStatic(const char* contents, const char* content_type) {
   // Flash-resident static responses: no large temporary String allocations.
   // Avoid serving stale JS/CSS after a firmware update while debugging portal
   // compatibility. We can enable immutable versioned asset caching later.
-  s_wm.server->sendHeader("Cache-Control", "no-store");
-  s_wm.server->send_P(200, content_type, contents);
+  s_current_http_server->sendHeader("Cache-Control", "no-store");
+  s_current_http_server->send_P(200, content_type, contents);
   noteWebResponse();
 }
 
 void sendNoCache(int status, const char* type, const String& body,
                  bool defer_rendering = true) {
-  s_wm.server->sendHeader("Cache-Control", "no-store");
-  s_wm.server->send(status, type, body);
+  s_current_http_server->sendHeader("Cache-Control", "no-store");
+  s_current_http_server->send(status, type, body);
   if (defer_rendering) noteWebResponse();
 }
 
@@ -251,7 +284,7 @@ class SaveGuard {
 };
 
 void sendSaveBusy() {
-  s_wm.server->sendHeader("Retry-After", "1");
+  s_current_http_server->sendHeader("Retry-After", "1");
   sendNoCache(503, "text/plain", "ADS-B download busy; save will retry");
 }
 
@@ -277,20 +310,20 @@ void handleGeneralGet() {
 
 void handleGeneralPost() {
   const uint32_t start = micros();
-  if (!s_wm.server->hasArg("lat") || !s_wm.server->hasArg("lon") ||
-      !s_wm.server->hasArg("range") || !s_wm.server->hasArg("bgtheme") ||
-      !s_wm.server->hasArg("bgpattern")) {
+  if (!s_current_http_server->hasArg("lat") || !s_current_http_server->hasArg("lon") ||
+      !s_current_http_server->hasArg("range") || !s_current_http_server->hasArg("bgtheme") ||
+      !s_current_http_server->hasArg("bgpattern")) {
     sendNoCache(400, "text/plain", "Missing location/range"); return;
   }
-  const String index_text = s_wm.server->arg("range");
+  const String index_text = s_current_http_server->arg("range");
   if (index_text.length() != 1 || index_text[0] < '0' ||
       index_text[0] >= '0' + ui::radar::kRangePresetCount) {
     sendNoCache(400, "text/plain", "Invalid radar range"); return;
   }
-  const String lat = s_wm.server->arg("lat");
-  const String lon = s_wm.server->arg("lon");
-  const String bgtheme = s_wm.server->arg("bgtheme");
-  const String bgpattern = s_wm.server->arg("bgpattern");
+  const String lat = s_current_http_server->arg("lat");
+  const String lon = s_current_http_server->arg("lon");
+  const String bgtheme = s_current_http_server->arg("bgtheme");
+  const String bgpattern = s_current_http_server->arg("bgpattern");
   if (bgtheme.length() != 1 || bgtheme[0] < '0' || bgtheme[0] > '5' ||
       bgpattern.length() != 1 || bgpattern[0] < '0' || bgpattern[0] > '5') {
     sendNoCache(400, "text/plain", "Invalid radar color/pattern"); return;
@@ -303,9 +336,9 @@ void handleGeneralPost() {
   ui::radar::rangeSetIndex(static_cast<uint8_t>(index_text[0] - '0'));
   ui::radar::saveBackgroundTheme(static_cast<uint8_t>(bgtheme[0] - '0'));
   ui::radar::saveBackgroundPattern(static_cast<uint8_t>(bgpattern[0] - '0'));
-  ui::radar::saveMilesFromPortal(isChecked(s_wm.server->arg("miles")) ? "T" : "");
-  ui::radar::saveRunwaysFromPortal(isChecked(s_wm.server->arg("runways")) ? "T" : "");
-  ui::altitude_units::save(isChecked(s_wm.server->arg("metres")) ? "m" : "ft");
+  ui::radar::saveMilesFromPortal(isChecked(s_current_http_server->arg("miles")) ? "T" : "");
+  ui::radar::saveRunwaysFromPortal(isChecked(s_current_http_server->arg("runways")) ? "T" : "");
+  ui::altitude_units::save(isChecked(s_current_http_server->arg("metres")) ? "m" : "ft");
   ui::radarDisplayThemeChanged();
   sendNoCache(200, "text/plain", "Saved");
   s_last_web_us = micros() - start;
@@ -327,16 +360,21 @@ void handleAircraftGet() {
   result += String(ui::trails::startDarkeningPercent());
   result += '\n';
   result += String(ui::trails::fadeCurve());
+  result += '\n';
+  result += String(ui::trails::dotSpacing());
+  result += '\n';
+  result += String(ui::trails::dotDiameterHalfPx());
   sendNoCache(200, "text/plain; charset=utf-8", result);
   s_last_web_us = micros() - start;
 }
 
 void handleAircraftPost() {
   const uint32_t start = micros();
-  auto* server = s_wm.server.get();
+  auto* server = s_current_http_server;
   if (!server->hasArg("colors") || !server->hasArg("options") ||
       !server->hasArg("trail") || !server->hasArg("trailDark") ||
-      !server->hasArg("trailCurve") || !server->hasArg("watchlist")) {
+      !server->hasArg("trailCurve") || !server->hasArg("dotSpacing") ||
+      !server->hasArg("dotSize") || !server->hasArg("watchlist")) {
     sendNoCache(400, "text/plain", "Missing aircraft settings"); return;
   }
   const String colors = server->arg("colors");
@@ -344,10 +382,13 @@ void handleAircraftPost() {
   const String trail = server->arg("trail");
   const String trailDark = server->arg("trailDark");
   const String trailCurve = server->arg("trailCurve");
+  const String dotSpacing = server->arg("dotSpacing");
+  const String dotSize = server->arg("dotSize");
   const String watches = server->arg("watchlist");
   if (colors.length() > 48 || options.length() > 24 ||
       trail.length() > 3 || trailDark.length() > 3 ||
-      trailCurve.length() > 2 || watches.length() > 3700) {
+      trailCurve.length() > 2 || dotSpacing.length() > 2 ||
+      dotSize.length() > 2 || watches.length() > 3700) {
     sendNoCache(400, "text/plain", "Aircraft settings too long"); return;
   }
   // Keep web settings writes out of the TLS handshake/parse lifetime.
@@ -370,6 +411,12 @@ void handleAircraftPost() {
   if (!ui::trails::saveFadeCurve(trailCurve.c_str())) {
     sendNoCache(400, "text/plain", "Invalid trail fade curve"); return;
   }
+  if (!ui::trails::saveDotSpacing(dotSpacing.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid dot spacing"); return;
+  }
+  if (!ui::trails::saveDotDiameterHalfPx(dotSize.c_str())) {
+    sendNoCache(400, "text/plain", "Invalid dot diameter"); return;
+  }
   if (!services::watchlist::save(watches.c_str())) {
     sendNoCache(400, "text/plain", "Invalid watchlist"); return;
   }
@@ -380,7 +427,7 @@ void handleAircraftPost() {
 
 void handleStatusGet() {
   const uint32_t start = micros();
-  char response[820];
+  char response[1050];
   const ui::RadarFrameTimings timing = ui::radarDisplayFrameTimings();
   const ui::RadarSpiSlowDiag slow_spi = ui::radarDisplaySpiSlowDiag();
   const unsigned long last = services::adsb::lastUpdateMs();
@@ -390,7 +437,16 @@ void handleStatusGet() {
   } else {
     snprintf(age, sizeof(age), "%lu", millis() - last);
   }
-  snprintf(response, sizeof(response),
+  char last_verified_recovery_age[24];
+  if (!s_web_health_verified_recovery_total) {
+    strcpy(last_verified_recovery_age, "null");
+  } else {
+    snprintf(last_verified_recovery_age, sizeof(last_verified_recovery_age), "%lu",
+             static_cast<unsigned long>((millis() - s_web_last_verified_recovery_ms) / 1000u));
+  }
+  const unsigned long long uptime_sec =
+      static_cast<unsigned long long>(esp_timer_get_time() / 1000000LL);
+  const int response_len = snprintf(response, sizeof(response),
       "{\"version\":\"%s\",\"rssi\":%d,\"heap\":%lu,\"minheap\":%lu,\"count\":%u,"
       "\"fetchAgeMs\":%s,\"frameIntervalMs\":%u,\"renderUs\":%lu,\"slowUs\":%lu,\"webUs\":%lu,\"frames\":%u,\"largestHeap\":%lu,"
       "\"gridUs\":%lu,\"runwaysUs\":%lu,\"projectionUs\":%lu,"
@@ -398,7 +454,10 @@ void handleStatusGet() {
       "\"iconsUs\":%lu,\"transferUs\":%lu,"
       "\"flashGrid\":%u,\"flashCopyUs\":%lu,"
       "\"cpuMhz\":%lu,\"frameCpuStart\":%u,\"frameCpuEnd\":%u,"
-      "\"slowSpiCount\":%lu,\"slowSpiCpuStart\":%u,\"slowSpiCpuEnd\":%u,\"slowSpiUs\":%lu}",
+      "\"slowSpiCount\":%lu,\"slowSpiCpuStart\":%u,\"slowSpiCpuEnd\":%u,\"slowSpiUs\":%lu,"
+      "\"uptimeSec\":%llu,\"webHealthOk\":%lu,\"webHealthFailed\":%lu,"
+      "\"webRebuilds\":%lu,\"webVerifiedRecoveries\":%lu,"
+      "\"webLastRecoveryAgeSec\":%s}",
       firmware::kVersion, WiFi.RSSI(), static_cast<unsigned long>(ESP.getFreeHeap()),
       static_cast<unsigned long>(ESP.getMinFreeHeap()),
       static_cast<unsigned>(services::adsb::aircraftCount()), age,
@@ -424,53 +483,62 @@ void handleStatusGet() {
       static_cast<unsigned long>(slow_spi.count),
       static_cast<unsigned>(slow_spi.cpu_mhz_start),
       static_cast<unsigned>(slow_spi.cpu_mhz_end),
-      static_cast<unsigned long>(slow_spi.last_transfer_us));
+      static_cast<unsigned long>(slow_spi.last_transfer_us),
+      uptime_sec,
+      static_cast<unsigned long>(s_web_health_ok_total),
+      static_cast<unsigned long>(s_web_health_fail_total),
+      static_cast<unsigned long>(s_web_health_rebuild_total),
+      static_cast<unsigned long>(s_web_health_verified_recovery_total),
+      last_verified_recovery_age);
+  if (response_len < 0 || static_cast<size_t>(response_len) >= sizeof(response)) {
+    sendNoCache(500, "text/plain", "Status response too large", false);
+    return;
+  }
   // Diagnostics polling must not pause radar rendering for 650 ms.
   sendNoCache(200, "application/json", response, false);
   s_last_web_us = micros() - start;
 }
 
-void bindRadarRoutes() {
-  if (!s_wm.server) return;
-  s_wm.server->on("/wifi-settings", HTTP_GET, []() {
+void bindRadarRoutes(WebServer& server) {
+  server.on("/wifi-settings", HTTP_GET, []() {
     if (wifiLinkUp()) {
       finishWifiWork();
       sendStatic(kWifiSettingsHtml, "text/html; charset=utf-8");
     } else {
-      s_wm.server->sendHeader("Location", "/wifi");
-      s_wm.server->send(302, "text/plain", "Wi-Fi setup");
+      s_current_http_server->sendHeader("Location", "/wifi");
+      s_current_http_server->send(302, "text/plain", "Wi-Fi setup");
     }
   });
-  s_wm.server->on("/api/wifi/ssid", HTTP_GET, []() {
+  server.on("/api/wifi/ssid", HTTP_GET, []() {
     sendNoCache(200, "text/plain; charset=utf-8", WiFi.SSID());
   });
   // Wi-Fi prep never performs a scan in the HTTP callback. The existing
   // WiFiManager /wifi endpoint is opened only after ADS-B TLS is idle.
-  s_wm.server->on("/wifi-prepare", HTTP_GET, []() {
+  server.on("/wifi-prepare", HTTP_GET, []() {
     if (wifiLinkUp()) {
       beginWifiWork();
       sendStatic(kWifiPrepareHtml, "text/html; charset=utf-8");
     } else {
       // During captive AP setup, the radar is not fetching data yet.
-      s_wm.server->sendHeader("Location", "/wifi");
-      s_wm.server->send(302, "text/plain", "Wi-Fi setup");
+      s_current_http_server->sendHeader("Location", "/wifi");
+      s_current_http_server->send(302, "text/plain", "Wi-Fi setup");
     }
   });
-  s_wm.server->on("/api/wifi/ready", HTTP_GET, []() {
+  server.on("/api/wifi/ready", HTTP_GET, []() {
     char result[80];
     const bool active = radarWorkPausedInternal();
     const bool fetching = s_adsb_fetch_active.load();
     snprintf(result, sizeof(result),
              "{\"paused\":%s,\"fetching\":%s,\"ready\":%s}",
              active ? "true" : "false", fetching ? "true" : "false",
-             (active && !fetching) ? "true" : "false");
+             (active && !fetching && s_wm.getWebPortalActive()) ? "true" : "false");
     sendNoCache(200, "application/json", result);
   });
-  s_wm.server->on("/api/wifi/ping", HTTP_GET, []() {
+  server.on("/api/wifi/ping", HTTP_GET, []() {
     keepWifiWorkAlive();
     sendNoCache(200, "text/plain", "OK");
   });
-  s_wm.server->on("/api/wifi/resume", HTTP_GET, []() {
+  server.on("/api/wifi/resume", HTTP_GET, []() {
     finishWifiWork();
     sendNoCache(200, "text/plain", "OK");
   });
@@ -480,15 +548,15 @@ void bindRadarRoutes() {
   // webserver uses the first matching route. Do not allow a generic captive-
   // portal landing page to substitute an unusable address for the LAN home.
   // The LAN home serves General directly: no DNS/mDNS or absolute redirects.
-  s_wm.server->on("/", HTTP_GET, []() {
+  server.on("/", HTTP_GET, []() {
     finishWifiWork();
     if (wifiLinkUp()) {
       sendStatic(services::radar_web_pages::kGeneral,
                  "text/html; charset=utf-8");
     } else {
       // During first-time setup, continue exposing WiFiManager's /wifi route.
-      s_wm.server->sendHeader("Cache-Control", "no-store");
-      s_wm.server->send(200, "text/html; charset=utf-8",
+      s_current_http_server->sendHeader("Cache-Control", "no-store");
+      s_current_http_server->send(200, "text/html; charset=utf-8",
           "<!doctype html><html><head><meta name='viewport' "
           "content='width=device-width,initial-scale=1'>"
           "<title>Plane Radar Setup</title>"
@@ -504,49 +572,50 @@ void bindRadarRoutes() {
   });
   // Ultra-lightweight test: distinguishes name-resolution / routing errors
   // from a busy server and works without loading any JavaScript.
-  s_wm.server->on("/health", HTTP_GET, []() {
-    s_wm.server->sendHeader("Cache-Control", "no-store");
-    s_wm.server->send(200, "text/plain; charset=utf-8",
+  server.on("/health", HTTP_GET, []() {
+    ++s_web_health_handler_hits;
+    s_current_http_server->sendHeader("Cache-Control", "no-store");
+    s_current_http_server->send(200, "text/plain; charset=utf-8",
                       "Plane Radar web server OK\n");
     noteWebResponse();
   });
-  s_wm.server->on("/general", HTTP_GET, []() {
+  server.on("/general", HTTP_GET, []() {
     finishWifiWork();
     sendStatic(services::radar_web_pages::kGeneral, "text/html; charset=utf-8");
   });
-  s_wm.server->on("/aircraft", HTTP_GET, []() {
+  server.on("/aircraft", HTTP_GET, []() {
     finishWifiWork();
     sendStatic(services::radar_web_pages::kAircraft, "text/html; charset=utf-8");
   });
-  s_wm.server->on("/status", HTTP_GET, []() {
+  server.on("/status", HTTP_GET, []() {
     finishWifiWork();
     sendStatic(services::radar_web_pages::kStatus, "text/html; charset=utf-8");
   });
-  s_wm.server->on("/assets/radar.css", HTTP_GET, []() {
+  server.on("/assets/radar.css", HTTP_GET, []() {
     sendStatic(services::radar_web_pages::kCss, "text/css; charset=utf-8");
   });
-  s_wm.server->on("/assets/general.js", HTTP_GET, []() {
+  server.on("/assets/general.js", HTTP_GET, []() {
     sendStatic(services::radar_web_pages::kGeneralJs, "application/javascript; charset=utf-8");
   });
-  s_wm.server->on("/assets/aircraft.js", HTTP_GET, []() {
+  server.on("/assets/aircraft.js", HTTP_GET, []() {
     sendStatic(services::radar_web_pages::kAircraftJs, "application/javascript; charset=utf-8");
   });
-  s_wm.server->on("/assets/status.js", HTTP_GET, []() {
+  server.on("/assets/status.js", HTTP_GET, []() {
     sendStatic(services::radar_web_pages::kStatusJs, "application/javascript; charset=utf-8");
   });
   // Small readiness probe prevents resending a large watchlist POST while a
   // TLS handshake owns the internal heap. The POST also checks the same gate.
-  s_wm.server->on("/api/save-ready", HTTP_GET, []() {
+  server.on("/api/save-ready", HTTP_GET, []() {
     const bool ready = s_fetch_save_gate.reserveSaveWindow(millis());
-    if (!ready) s_wm.server->sendHeader("Retry-After", "1");
+    if (!ready) s_current_http_server->sendHeader("Retry-After", "1");
     sendNoCache(ready ? 200 : 503, "text/plain",
                 ready ? "Ready" : "ADS-B download busy", false);
   });
-  s_wm.server->on("/api/general", HTTP_GET, handleGeneralGet);
-  s_wm.server->on("/api/general", HTTP_POST, handleGeneralPost);
-  s_wm.server->on("/api/aircraft", HTTP_GET, handleAircraftGet);
-  s_wm.server->on("/api/aircraft", HTTP_POST, handleAircraftPost);
-  s_wm.server->on("/api/status", HTTP_GET, handleStatusGet);
+  server.on("/api/general", HTTP_GET, handleGeneralGet);
+  server.on("/api/general", HTTP_POST, handleGeneralPost);
+  server.on("/api/aircraft", HTTP_GET, handleAircraftGet);
+  server.on("/api/aircraft", HTTP_POST, handleAircraftPost);
+  server.on("/api/status", HTTP_GET, handleStatusGet);
 }
 
 void markForceConfigPortal() {
@@ -660,51 +729,54 @@ void ensureWifiManager() {
   s_wm.setAPCallback(onConfigPortalApStarted);
   s_wm.setCustomHeadElement(kWifiNavigationHead);
   s_wm.setTitle("Plane Radar Wi-Fi");
-  s_wm.setWebServerCallback(bindRadarRoutes);
+  s_wm.setWebServerCallback([]() {
+    if (s_wm.server) bindRadarRoutes(*s_wm.server);
+  });
   s_wm_configured = true;
 }
 
 void startLanWebPortal() {
-  if (!wifiLinkUp() || s_wm.getWebPortalActive() ||
-      s_wm.getConfigPortalActive()) {
-    return;
-  }
-  // When allocation/startup fails, don't retry on every 10-ms main loop.
+  if (!wifiLinkUp() || s_lan_server || s_wm.getConfigPortalActive()) return;
   const uint32_t now = millis();
   if (s_web_last_start_attempt_ms &&
       static_cast<uint32_t>(now - s_web_last_start_attempt_ms) < 5000u) return;
   s_web_last_start_attempt_ms = now ? now : 1u;
-  WiFi.mode(WIFI_STA);
-  s_wm.setConfigPortalBlocking(false);
-#ifdef WM_MDNS
-  MDNS.end();
-  if (MDNS.begin(config::kPortalHostname)) {
-    MDNS.addService("http", "tcp", 80);
+
+  // Radar HTTP on port 80. WiFiManager opens its separate temporary server
+  // on port 81 only when users request Wi-Fi setup from the radar web page.
+  s_lan_server.reset(new (std::nothrow) WebServer(80));
+  if (!s_lan_server) {
+    Serial.println("LAN HTTP allocation failed; will retry");
+    return;
   }
-#endif
-  s_wm.startWebPortal();
-  s_web_started_ms = s_wm.getWebPortalActive() ? millis() : 0;
-  if (!s_wm.getWebPortalActive())
-    Serial.println("LAN HTTP start failed; will retry in 5 seconds");
+  bindRadarRoutes(*s_lan_server);
+  s_lan_server->begin();
+  s_web_started_ms = millis();
   s_web_last_probe_ms = 0;
   s_web_probe_failures = 0;
-  Serial.printf("LAN HTTP startup: portal=%s, server=%s, heap=%u\r\n",
-                s_wm.getWebPortalActive() ? "active" : "inactive",
-                s_wm.server ? "allocated" : "null",
+  s_web_probe_state = WebProbeState::kIdle;
+  s_web_probe_reply.reset();
+#ifdef WM_MDNS
+  MDNS.end();
+  if (MDNS.begin(config::kPortalHostname)) MDNS.addService("http", "tcp", 80);
+#endif
+  Serial.printf("LAN HTTP startup: standalone port=80, heap=%u\r\n",
                 static_cast<unsigned>(ESP.getFreeHeap()));
   Serial.printf("LAN web: http://%s/ (General)\r\n",
                 WiFi.localIP().toString().c_str());
   Serial.printf("LAN health check: http://%s/health\r\n",
                 WiFi.localIP().toString().c_str());
-  Serial.printf("Optional mDNS: http://%s.local/ (may not resolve on every network)\r\n",
-                config::kPortalHostname);
 }
 
 void stopLanWebPortal() {
-  if (!s_wm.getWebPortalActive()) {
-    return;
-  }
-  s_wm.stopWebPortal();
+  // Never retain a self-test socket across listener teardown/recreation.
+  s_web_probe_client.stop();
+  s_web_probe_state = WebProbeState::kIdle;
+  s_web_probe_reply.reset();
+  if (!s_lan_server) return;
+  s_lan_server->stop();
+  s_lan_server.reset();
+  s_current_http_server = nullptr;
   s_web_started_ms = 0;
   s_web_last_probe_ms = 0;
   s_web_probe_failures = 0;
@@ -713,35 +785,138 @@ void stopLanWebPortal() {
 #endif
 }
 
-// Called from the main loop only. Checking our own address distinguishes a
-// working Wi-Fi/ICMP link from a missing TCP listener; it does not block the
-// radar for more than the short socket connect timeout. The probe only tests
-// TCP accept; it deliberately does not claim to test HTTP request handling.
-void monitorLanWebPortal() {
-  if (!wifiLinkUp() || !s_wm.getWebPortalActive() ||
-      s_wm.getConfigPortalActive() || !s_web_started_ms) return;
+// A small, cooperative HTTP self-test. Like the previous TCP test, it cannot
+// prove the *external* route through the user's router, but it does prove
+// that handleClient() accepted and answered an actual GET /health request.
+// Only main loop accesses this WiFiClient and WebServer: no cross-task calls.
+void webProbeFinished(bool healthy, const char* reason) {
+  const size_t response_bytes = s_web_probe_reply.length();
+  const uint32_t elapsed = millis() - s_web_probe_started_ms;
+  s_web_probe_client.stop();
+  s_web_probe_state = WebProbeState::kIdle;
+  if (healthy) {
+    ++s_web_health_ok_total;
+    if (s_web_verify_after_rebuild) {
+      ++s_web_health_verified_recovery_total;
+      s_web_last_verified_recovery_ms = millis();
+    }
+    if (s_web_probe_failures || s_web_verify_after_rebuild) {
+      Serial.printf("LAN HTTP /health verified: after_rebuild=%u "
+                    "previous_failures=%u latency=%lums "
+                    "ok=%lu failed=%lu rebuilds=%lu\r\n",
+                    static_cast<unsigned>(s_web_verify_after_rebuild),
+                    static_cast<unsigned>(s_web_probe_failures),
+                    static_cast<unsigned long>(elapsed),
+                    static_cast<unsigned long>(s_web_health_ok_total),
+                    static_cast<unsigned long>(s_web_health_fail_total),
+                    static_cast<unsigned long>(s_web_health_rebuild_total));
+    }
+    s_web_verify_after_rebuild = false;
+    s_web_probe_failures = 0;
+    return;
+  }
+
+  ++s_web_health_fail_total;
+  if (s_web_probe_failures < kWebProbeFailuresBeforeRestart)
+    ++s_web_probe_failures;
+  Serial.printf("LAN HTTP /health failed (%u/%u): reason=%s elapsed=%lums "
+                "bytes=%u handler_hits=%lu heap=%u largest=%u wifi=%d rssi=%d "
+                "ok=%lu failed=%lu rebuilds=%lu\r\n",
+                static_cast<unsigned>(s_web_probe_failures),
+                static_cast<unsigned>(kWebProbeFailuresBeforeRestart),
+                reason, static_cast<unsigned long>(elapsed),
+                static_cast<unsigned>(response_bytes),
+                static_cast<unsigned long>(s_web_health_handler_hits -
+                                           s_web_probe_handler_hits_at_start),
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                static_cast<int>(WiFi.status()), static_cast<int>(WiFi.RSSI()),
+                static_cast<unsigned long>(s_web_health_ok_total),
+                static_cast<unsigned long>(s_web_health_fail_total),
+                static_cast<unsigned long>(s_web_health_rebuild_total));
+  if (s_web_probe_failures < kWebProbeFailuresBeforeRestart) return;
   const uint32_t now = millis();
+  if (s_web_last_rebuild_ms &&
+      static_cast<uint32_t>(now - s_web_last_rebuild_ms) < kWebRestartCooldownMs) {
+    Serial.println("LAN HTTP rebuild deferred: cooldown active");
+    return;
+  }
+  s_web_last_rebuild_ms = now ? now : 1u;
+  ++s_web_health_rebuild_total;
+  s_web_verify_after_rebuild = true;
+  Serial.printf("LAN HTTP /health unavailable: rebuilding standalone server "
+                "(rebuild #%lu)\r\n",
+                static_cast<unsigned long>(s_web_health_rebuild_total));
+  stopLanWebPortal();
+  startLanWebPortal();
+}
+
+void monitorLanWebPortal() {
+  if (!wifiLinkUp() || !s_lan_server || s_wm.getConfigPortalActive() ||
+      !s_web_started_ms) return;
+  const uint32_t now = millis();
+
+  if (s_web_probe_state == WebProbeState::kAwaitingResponse) {
+    // Check after handleClient() has had a chance to respond. Limit both time
+    // and bytes per loop so health monitoring cannot stall rendering/HTTP.
+    uint16_t processed = 0;
+    while (s_web_probe_client.available() > 0 && processed < 192) {
+      const int incoming = s_web_probe_client.read();
+      if (incoming < 0) break;
+      s_web_probe_reply.append(static_cast<uint8_t>(incoming));
+      ++processed;
+    }
+    switch (s_web_probe_reply.result()) {
+      case services::web_health::Reply::Result::kOk:
+        webProbeFinished(true, "ok");
+        return;
+      case services::web_health::Reply::Result::kBadStatus:
+        webProbeFinished(false, "http_status");
+        return;
+      case services::web_health::Reply::Result::kBadBody:
+        webProbeFinished(false, "bad_health_body");
+        return;
+      case services::web_health::Reply::Result::kTooLarge:
+        webProbeFinished(false, "oversized_response");
+        return;
+      case services::web_health::Reply::Result::kPending:
+        break;
+    }
+    if (!s_web_probe_client.connected() && s_web_probe_client.available() == 0) {
+      webProbeFinished(false, "connection_closed_before_health");
+    } else if (static_cast<uint32_t>(now - s_web_probe_started_ms) >=
+               kWebProbeResponseTimeoutMs) {
+      webProbeFinished(false, "http_timeout");
+    }
+    return;
+  }
+
   if (static_cast<uint32_t>(now - s_web_started_ms) < kWebStartupGraceMs ||
       (s_web_last_probe_ms &&
        static_cast<uint32_t>(now - s_web_last_probe_ms) < kWebProbeIntervalMs) ||
       s_adsb_fetch_active.load(std::memory_order_relaxed) ||
-      radarWorkPausedInternal()) return;
+      radarWorkPausedInternal() || s_wifi_admin_requested) return;
+
   s_web_last_probe_ms = now;
-  WiFiClient probe;
-  const bool listening = probe.connect(WiFi.localIP(), 80, 150);
-  probe.stop();
-  if (listening) {
-    if (s_web_probe_failures) Serial.println("LAN HTTP listener recovered");
-    s_web_probe_failures = 0;
+  s_web_probe_started_ms = now;
+  s_web_probe_handler_hits_at_start = s_web_health_handler_hits;
+  s_web_probe_reply.reset();
+  if (!s_web_probe_client.connect(WiFi.localIP(), 80, 350)) {
+    webProbeFinished(false, "tcp_connect");
     return;
   }
-  Serial.printf("LAN HTTP listener probe failed (%u/2), heap=%u\r\n",
-                static_cast<unsigned>(s_web_probe_failures + 1),
-                static_cast<unsigned>(ESP.getFreeHeap()));
-  if (++s_web_probe_failures < 2) return;
-  Serial.println("LAN HTTP listener unavailable: restarting web portal only");
-  stopLanWebPortal();
-  startLanWebPortal();
+  static const char kHealthRequest[] =
+      "GET /health HTTP/1.0\r\n"
+      "Host: plane-radar-selfcheck\r\n"
+      "Connection: close\r\n\r\n";
+  const size_t request_length = sizeof(kHealthRequest) - 1;
+  const size_t written = s_web_probe_client.write(
+      reinterpret_cast<const uint8_t*>(kHealthRequest), request_length);
+  if (written != request_length) {
+    webProbeFinished(false, "http_request_write");
+    return;
+  }
+  s_web_probe_state = WebProbeState::kAwaitingResponse;
 }
 
 void prepareSta() {
@@ -837,6 +1012,10 @@ bool connectSavedNetwork(bool show_ui) {
 
 bool openConfigPortal() {
   stopLanWebPortal();
+  if (s_wm.getWebPortalActive()) s_wm.stopWebPortal();
+  s_wifi_admin_requested = false;
+  s_wifi_admin_close_requested = false;
+  s_wm.setHttpPort(80);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   delay(50);
@@ -845,9 +1024,10 @@ bool openConfigPortal() {
   s_wm.startConfigPortal(config::kPortalApName);
   while (s_wm.getConfigPortalActive()) {
     bootButtonPollLongPress();
-    if (s_wm.process()) {
-      return true;
-    }
+    s_current_http_server = s_wm.server.get();
+    const bool connected = s_wm.process();
+    s_current_http_server = nullptr;
+    if (connected) return true;
     delay(10);
   }
   return wifiLinkUp();
@@ -954,16 +1134,41 @@ bool wifiReconnect() {
 void wifiLoop() {
   ensureWifiManager();
   if (wifiLinkUp()) {
-    if (!s_wm.getWebPortalActive() && !s_wm.getConfigPortalActive()) {
-      startLanWebPortal();
+    if (!s_lan_server && !s_wm.getConfigPortalActive()) startLanWebPortal();
+    if (s_lan_server) {
+      s_current_http_server = s_lan_server.get();
+      s_lan_server->handleClient();
+    }
+
+    // WiFiManager only runs for on-demand Wi-Fi scans and credential changes.
+    // It never owns or restarts the standard radar LAN port 80.
+    if (s_wifi_admin_requested && !s_wifi_admin_close_requested &&
+        !s_wm.getWebPortalActive() && !s_wm.getConfigPortalActive()) {
+      s_wm.setHttpPort(kWifiAdminPort);
+      s_wm.setConfigPortalBlocking(false);
+      s_wm.startWebPortal();
+      Serial.printf("Wi-Fi admin portal on port %u: %s\r\n",
+                    static_cast<unsigned>(kWifiAdminPort),
+                    s_wm.getWebPortalActive() ? "active" : "failed");
     }
     if (s_wm.getWebPortalActive() || s_wm.getConfigPortalActive()) {
       bootButtonPollLongPress();
+      s_current_http_server = s_wm.server.get();
       s_wm.process();
     }
+    if (s_wifi_admin_close_requested && s_wm.getWebPortalActive()) {
+      s_wm.stopWebPortal();
+      s_wifi_admin_requested = false;
+      s_wifi_admin_close_requested = false;
+      Serial.println("Wi-Fi admin portal closed; radar HTTP remains active");
+    }
+    s_current_http_server = nullptr;
     monitorLanWebPortal();
   } else {
     stopLanWebPortal();
+    if (s_wm.getWebPortalActive()) s_wm.stopWebPortal();
+    s_wifi_admin_requested = false;
+    s_wifi_admin_close_requested = false;
   }
 }
 

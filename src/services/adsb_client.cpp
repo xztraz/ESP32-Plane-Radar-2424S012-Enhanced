@@ -15,6 +15,8 @@
 #include <cstring>
 
 #include "config.h"
+#include "firmware_version.h"
+#include "services/adsb_fetch_diagnostics.h"
 #include "services/http_body_framing.h"
 #include "services/http_response_head.h"
 
@@ -93,7 +95,8 @@ class FetchTrace {
     }
     const uint32_t now = millis();
     const uint32_t new_alloc_fails = s_alloc_fail_count - initial_fail_count_;
-    const bool anomaly = !success_ || new_alloc_fails != 0;
+    const bool anomaly = (!success_ && !unexpected_payload_) ||
+                         new_alloc_fails != 0;
     // Keep useful failure evidence, but don't flood the serial monitor with
     // the experimental five-stage heap report every 30 seconds.
     if (!anomaly && s_successes_ > 1 &&
@@ -157,6 +160,9 @@ class FetchTrace {
   }
   void afterHttpEnd() { after_end_ = heapSample(); }
   void markSuccess() { success_ = true; }
+  // HTTP/TLS succeeded, but the application payload was rejected. This is a
+  // failed update, not a TLS fault; avoid five-stage heap spam on every poll.
+  void markUnexpectedPayload() { unexpected_payload_ = true; }
 
  private:
   HeapSample before_get_;
@@ -166,6 +172,7 @@ class FetchTrace {
   const uint32_t initial_fail_count_;
   int http_code_ = 0;
   bool success_ = false;
+  bool unexpected_payload_ = false;
   static uint32_t s_attempts_;
   static uint32_t s_successes_;
   static uint32_t s_failures_;
@@ -182,6 +189,7 @@ Aircraft s_aircraft[kMaxAircraft];
 size_t s_aircraft_count = 0;
 unsigned long s_last_update_ms = 0;
 PollFn s_poll_fn = nullptr;
+FetchDiagnostics s_fetch_diagnostics;
 SemaphoreHandle_t s_mutex = nullptr;
 
 /** Publish parsed aircraft to the shared buffer atomically. */
@@ -274,8 +282,8 @@ bool sendBearSslGet(ESP_SSLClient& client, const char* path) {
       "Accept: application/json\r\n"
       "Accept-Encoding: identity\r\n"
       "Connection: close\r\n"
-      "User-Agent: PlaneRadar-v2.0.0\r\n\r\n",
-      path, kApiHost);
+      "User-Agent: PlaneRadar-%s\r\n\r\n",
+      path, kApiHost, firmware::kVersion);
   if (n <= 0 || n >= static_cast<int>(sizeof(request))) return false;
   return client.write(reinterpret_cast<const uint8_t*>(request),
                       static_cast<size_t>(n)) == static_cast<size_t>(n);
@@ -418,8 +426,9 @@ void fillTagFields(Aircraft* ac, const JsonObject& plane) {
 }  // namespace
 
 void init() {
-  Serial.printf("ADSB TLS backend: BearSSL (RX=%dB TX=%dB, v2.0.0)\r\n",
-                kBearSslReceiveBufferBytes, kBearSslTransmitBufferBytes);
+  Serial.printf("ADSB TLS backend: BearSSL (RX=%dB TX=%dB, %s)\r\n",
+                kBearSslReceiveBufferBytes, kBearSslTransmitBufferBytes,
+                firmware::kVersion);
   if (s_mutex == nullptr) {
     s_mutex = xSemaphoreCreateMutex();
   }
@@ -432,7 +441,15 @@ void init() {
 
 void setPollFn(PollFn fn) { s_poll_fn = fn; }
 
-size_t aircraftCount() { return s_aircraft_count; }
+size_t aircraftCount() {
+  // The ADS-B task publishes under this mutex. Render and Status readers
+  // need the same lock to avoid racing with a freshly published zero/nonzero
+  // aircraft count. Only a single scalar is copied while holding the lock.
+  if (s_mutex != nullptr) xSemaphoreTake(s_mutex, portMAX_DELAY);
+  const size_t count = s_aircraft_count;
+  if (s_mutex != nullptr) xSemaphoreGive(s_mutex);
+  return count;
+}
 
 const Aircraft* aircraftList() { return s_aircraft; }
 
@@ -511,6 +528,7 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   // Keep only the fields we render; the rest never reaches RAM.
   JsonDocument filter;
   JsonObject f = filter["ac"].add<JsonObject>();
+  filter["total"] = true;  // Response metadata for zero-aircraft diagnostics.
   for (const char* key :
        {"lat", "lon", "true_heading", "mag_heading", "track", "dir", "gs",
         "tas", "ias", "alt_baro", "alt_geom", "seen_pos", "flight", "hex", "t",
@@ -551,50 +569,101 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
 
   // Parse into a local buffer, then publish atomically so a reader on another
   // thread never sees a half-updated list.
+  JsonArray ac = doc["ac"].as<JsonArray>();
+  if (ac.isNull()) {
+    // A valid empty sky is {"ac": []}, NOT a missing/non-array ac value.
+    // Do not erase the previous snapshot or invent a zero-aircraft update.
+    // Repeated malformed replies are summarized only once every five minutes.
+    const auto event = s_fetch_diagnostics.invalidPayload(millis());
+    if (event.kind != FetchDiagnostics::EventKind::kNone) {
+      Serial.printf(
+          "adsb API payload ignored: ac not array, HTTP=200 repeats=%lu "
+          "body=%luB radius=%.1fkm center=%.6f,%.6f\r\n",
+          static_cast<unsigned long>(event.samples),
+          static_cast<unsigned long>(body.bytesRead()),
+          fetch_radius_km, center_lat, center_lon);
+    }
+    trace.markUnexpectedPayload();
+    return false;
+  }
+
+  // Count what the API sent separately from what the radar accepts. A genuine
+  // zero remains entirely normal; only the first zero, a 15-minute summary
+  // and recovery from a long zero period produce additional diagnostic lines.
+  const size_t api_count = ac.size();
+  size_t missing_position = 0;
+  size_t ground_filtered = 0;
   Aircraft parsed[kMaxAircraft];
   size_t n = 0;
-  JsonArray ac = doc["ac"].as<JsonArray>();
-  if (!ac.isNull()) {
-    for (JsonObject plane : ac) {
-      if (n >= kMaxAircraft) {
-        break;
-      }
-      if (!plane["lat"].is<float>() || !plane["lon"].is<float>()) {
-        continue;
-      }
-      if (isOnGround(plane) && !config::kAdsbShowGroundAircraft) {
-        continue;
-      }
-
-      parsed[n].lat = plane["lat"].as<float>();
-      parsed[n].lon = plane["lon"].as<float>();
-      parsed[n].nose_deg = pickNoseHeading(plane);
-      parsed[n].track_deg = pickTrackHeading(plane);
-      parsed[n].gs_knots = pickGroundSpeed(plane);
-      parsed[n].isMilitary = isMilitary(plane);
-
-      // seen_pos: seconds since this position was measured. Use it as the
-      // dead-reckoning age offset, capped so a very stale fix isn't flung far.
-      float seen_pos = 0.0f;
-      readJsonFloat(plane, "seen_pos", &seen_pos);
-      if (seen_pos < 0.0f) seen_pos = 0.0f;
-      if (seen_pos > 30.0f) seen_pos = 30.0f;
-      parsed[n].pos_age_ms = static_cast<uint32_t>(seen_pos * 1000.0f);
-
-      fillTagFields(&parsed[n], plane);
-      parsed[n].isHelicopter = isHelicopter(plane);
-      ++n;
+  for (JsonObject plane : ac) {
+    if (n >= kMaxAircraft) break;
+    if (!plane["lat"].is<float>() || !plane["lon"].is<float>()) {
+      ++missing_position;
+      continue;
     }
+    if (isOnGround(plane) && !config::kAdsbShowGroundAircraft) {
+      ++ground_filtered;
+      continue;
+    }
+
+    parsed[n].lat = plane["lat"].as<float>();
+    parsed[n].lon = plane["lon"].as<float>();
+    parsed[n].nose_deg = pickNoseHeading(plane);
+    parsed[n].track_deg = pickTrackHeading(plane);
+    parsed[n].gs_knots = pickGroundSpeed(plane);
+    parsed[n].isMilitary = isMilitary(plane);
+
+    // seen_pos: seconds since this position was measured. Use it as the
+    // dead-reckoning age offset, capped so a very stale fix isn't flung far.
+    float seen_pos = 0.0f;
+    readJsonFloat(plane, "seen_pos", &seen_pos);
+    if (seen_pos < 0.0f) seen_pos = 0.0f;
+    if (seen_pos > 30.0f) seen_pos = 30.0f;
+    parsed[n].pos_age_ms = static_cast<uint32_t>(seen_pos * 1000.0f);
+
+    fillTagFields(&parsed[n], plane);
+    parsed[n].isHelicopter = isHelicopter(plane);
+    ++n;
   }
 
   publish(parsed, n);
   Serial.printf("adsb: %u aircraft\r\n", static_cast<unsigned>(n));
+  const auto diagnostic = s_fetch_diagnostics.valid(
+      millis(), static_cast<unsigned>(n), fetch_radius_km,
+      center_lat, center_lon);
+  if (diagnostic.kind == FetchDiagnostics::EventKind::kZeroStarted ||
+      diagnostic.kind == FetchDiagnostics::EventKind::kZeroPeriodic) {
+    const long reported_total = doc["total"].is<int>()
+        ? static_cast<long>(doc["total"].as<int>()) : -1L;
+    Serial.printf(
+        "adsb zero %s (normal): duration=%lumin valid_samples=%lu "
+        "api=%u missing_pos=%u ground=%u total=%ld "
+        "radius=%.1fkm center=%.6f,%.6f\r\n",
+        diagnostic.kind == FetchDiagnostics::EventKind::kZeroStarted
+            ? "started" : "ongoing",
+        static_cast<unsigned long>(diagnostic.duration_ms / 60000u),
+        static_cast<unsigned long>(diagnostic.samples),
+        static_cast<unsigned>(api_count),
+        static_cast<unsigned>(missing_position),
+        static_cast<unsigned>(ground_filtered), reported_total,
+        fetch_radius_km, center_lat, center_lon);
+  } else if (diagnostic.kind == FetchDiagnostics::EventKind::kZeroEnded) {
+    Serial.printf(
+        "adsb zero ended: duration=%lumin valid_zero_samples=%lu "
+        "previous_radius=%.1fkm current_radius=%.1fkm "
+        "api=%u displayed=%u\r\n",
+        static_cast<unsigned long>(diagnostic.duration_ms / 60000u),
+        static_cast<unsigned long>(diagnostic.samples),
+        diagnostic.previous_radius_km, fetch_radius_km,
+        static_cast<unsigned>(api_count), static_cast<unsigned>(n));
+  }
   trace.markSuccess();
   static uint32_t successful_fetches = 0;
   if (++successful_fetches % 100 == 0) {
     const HeapSample after_fetch = heapSample();
-    Serial.printf("BearSSL v2.0.0: successful=%lu RX=%d TX=%d "
+    Serial.printf("BearSSL %s: successful=%lu RX=%d TX=%d "
                   "free=%lu largest=%lu min_free=%lu\r\n",
+                  firmware::kVersion,
                   static_cast<unsigned long>(successful_fetches),
                   kBearSslReceiveBufferBytes, kBearSslTransmitBufferBytes,
                   static_cast<unsigned long>(after_fetch.free_bytes),

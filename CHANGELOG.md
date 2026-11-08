@@ -1,8 +1,14 @@
 # Changes from MatixYo's ESP32-Plane-Radar
 
-This document describes the **customized fork's changes relative to the original project**, not every internal development iteration. The fork source version is **v2.0.0**.
+This document summarizes the enhanced ESP32-2424S012 fork. The current stable **source** version is **v2.0.1**. The fork is not presented as a rebase onto the latest upstream tag.
 
-This is an independently developed fork and is **not represented as a rebase of the latest upstream tag**. Compare against the actual fork parent commit when publishing to obtain an exact Git diff.
+## v2.0.1 — Stable source update
+
+- Standalone radar web server on port 80 with on-demand WiFiManager administration on port 81. A cooperative self-check validates HTTP 200 and the `/health` response body. After three failures, only the LAN HTTP server is rebuilt, with a two-minute cooldown. Serial logs record failure stages and restoration.
+- RAM-only Status diagnostics report uptime, successful/failed HTTP checks, automatic web server rebuilds, confirmed `/health` recoveries and the age of the last verified recovery. These reset on ESP32 reboot, and verified recovery means the local HTTP self-check completed; it does not prove the external network route.
+- ADS-B diagnostics distinguish normal zero-aircraft feeds, malformed JSON and recovered aircraft. Empty radar redraws resume automatically when aircraft return; aircraft-count reads are synchronized. Existing HTTPS and display behavior remains intact.
+- Adjustable anti-aliased additive recorded-position trail markers with slider-controlled spacing/size, fixed-point geometry, per-trail dot phases packed in existing RAM padding and no new frame buffers.
+- rc4.1 firmware survived an overnight user test with working browser access. Additional counters in this stable source revision have not yet been flashed or validated on the target; GitHub CI is the build verification source.
 
 ## Hardware and build
 

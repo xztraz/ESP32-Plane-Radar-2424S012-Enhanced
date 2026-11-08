@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
  echo.
  echo ===========================================================
- echo  PLANE RADAR v2.0.0 - UPLOAD TO ESP32-2424S012
+ echo  PLANE RADAR v2.0.1 - UPLOAD TO ESP32-2424S012
  echo  PlatformIO Core Python - no Git or separate Python needed
  echo ===========================================================
  echo.
@@ -37,7 +37,7 @@ echo.
 if errorlevel 1 goto uploadFailed
 
 echo.
-echo v2.0.0 CLEAN BUILD AND UPLOAD SUCCESSFUL.
+echo v2.0.1 CLEAN BUILD AND UPLOAD SUCCESSFUL.
 echo.
 pause
 exit /b 0
