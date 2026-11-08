@@ -46,6 +46,8 @@ Configure the radar from a browser using the General and Aircraft pages.
 
 ## Hardware
 
+<img src="docs/images/esp32-2424s012-hardware.jpg" alt="ESP32-2424S012 non-touch hardware, front and back with BOOT and RESET buttons and antennas" width="600">
+
 **Target:** ESP32-2424S012 *non-touch* module with built-in GC9A01 display. This is not a pin-compatible replacement for the separate-display wiring shown in the original project's README.
 
 Current firmware pin assignment from `include/config.h`:
